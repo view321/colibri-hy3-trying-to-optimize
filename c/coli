@@ -210,6 +210,33 @@ def resource_request(a, env):
         [int(value) for value in gpu.split(",")])
     return ram,ctx,devices,vram
 
+def apply_accel_env(e, a, engine):
+    """Pass --gpu/--vram to the engine without requiring --auto-tier."""
+    if a.gpu is None and not a.vram:
+        return e
+    has_cuda = cuda_binary(engine)
+    if a.gpu == "none":
+        e["COLI_CUDA"] = "0"
+        e.pop("COLI_GPU", None); e.pop("COLI_GPUS", None)
+        e.pop("CUDA_EXPERT_GB", None); e.pop("CUDA_DENSE", None)
+        return e
+    if a.gpu is not None and a.gpu != "auto":
+        if not has_cuda:
+            print(f"  {C.yel}!{C.r} --gpu ignored: engine is CPU-only (rebuild with make hy3 CUDA=1)", file=sys.stderr)
+            return e
+        e.setdefault("COLI_CUDA", "1")
+        e.pop("COLI_GPU", None); e.pop("COLI_GPUS", None)
+        devices = [int(v) for v in a.gpu.split(",")]
+        key = "COLI_GPU" if len(devices) == 1 else "COLI_GPUS"
+        e[key] = a.gpu
+    if a.vram and a.gpu != "none":
+        if not has_cuda:
+            print(f"  {C.yel}!{C.r} --vram ignored: engine is CPU-only (rebuild with make hy3 CUDA=1)", file=sys.stderr)
+            return e
+        e.setdefault("COLI_CUDA", "1")
+        e["CUDA_EXPERT_GB"] = str(a.vram)
+    return e
+
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
     if engine_for(a.model) == HY3 and "IDOT" not in e:
@@ -242,6 +269,8 @@ def env_for(a):
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
         gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
+    else:
+        e = apply_accel_env(e, a, engine_for(a.model))
     return e
 
 # ---------- rendering markdown in STREAMING per il terminale ----------
@@ -493,7 +522,7 @@ def cmd_chat(a):
         mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB", elog)
         if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
-            if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]","[DSA]","[KV]")):
+            if l.startswith(("[RAM_GB","[PIN]","[CUDA]","[MTP]","[USAGE]","[DSA]","[KV]")):
                 l=re.sub(r" ?\(?/[^ )]+\)?","",l.strip())       # via i percorsi lunghi
                 l=re.sub(r" from$","",l)
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:
