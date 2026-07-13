@@ -33,18 +33,6 @@ CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-
 LDFLAGS = -lm -fopenmp -static
 EXE     = .exe
 else
-UNAME_M := $(shell uname -m)
-ifneq (,$(filter ppc64le ppc64,$(UNAME_M)))
-# --- Linux PowerPC (POWER8/POWER9/POWER10) ---
-# PowerPC GCC uses -mcpu, not -march. ARCH=native works on gcc >= 4.7.
-# The AVX2/NEON kernels fall back to the portable scalar C path
-# (validated token-exact vs the transformers oracle on a POWER8 S824).
-CC      = gcc
-ARCH   ?= native
-CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp
-EXE     =
-else
 # --- Linux x86-64 (percorso originale, invariato) ---
 CC      = gcc
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
@@ -54,7 +42,6 @@ ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp
 EXE     =
-endif
 endif
 
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
@@ -80,7 +67,7 @@ LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
-all: glm$(EXE)
+all: glm$(EXE) hy3$(EXE)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
@@ -96,6 +83,9 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
+
+hy3$(EXE): hy3.c st.h json.h compat.h $(CUDA_OBJ)
+	$(CC) $(CFLAGS) hy3.c $(CUDA_OBJ) -o hy3$(EXE) $(LDFLAGS)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
@@ -134,7 +124,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
+	rm -f olmoe$(EXE) hy3$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test portable test-c test-python test check clean
+.PHONY: all glm hy3 cuda-test portable test-c test-python test check clean

@@ -126,14 +126,21 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
     layers = int(cfg.get("num_hidden_layers", 0)) + 1
-    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank", 0)) +
-                                   int(cfg.get("qk_rope_head_dim", 0))) * 4
-    kv_buffer = context * int(cfg.get("num_attention_heads", 0)) * (
-        int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
+    if cfg.get("model_type") == "hy_v3" or cfg.get("kv_lora_rank") is None:
+        hd = int(cfg.get("head_dim") or cfg.get("hidden_size", 0) // max(1, int(cfg.get("num_attention_heads", 1))))
+        n_kv = int(cfg.get("num_key_value_heads") or cfg.get("num_attention_heads", 0))
+        n_heads = int(cfg.get("num_attention_heads", 0))
+        kv_bytes = layers * context * n_kv * hd * 2 * 4
+        kv_buffer = context * n_heads * hd * 4
+    else:
+        kv_bytes = layers * context * (int(cfg.get("kv_lora_rank", 0)) +
+                                       int(cfg.get("qk_rope_head_dim", 0))) * 4
+        kv_buffer = context * int(cfg.get("num_attention_heads", 0)) * (
+            int(cfg.get("qk_nope_head_dim", 0)) + int(cfg.get("v_head_dim", 0))) * 4
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)
     cache_bytes = max(0, ram_budget - info["dense_bytes"] - runtime_bytes)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(cfg.get("n_routed_experts", 0))
+    configured_experts = int(cfg.get("n_routed_experts") or cfg.get("num_experts") or 0)
     cap = int(cache_bytes // per_cap) if per_cap else 0
     if configured_experts:
         cap = min(cap, configured_experts)

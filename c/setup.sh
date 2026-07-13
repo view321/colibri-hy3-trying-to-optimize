@@ -32,12 +32,16 @@ esac
 
 # 2) build: nativa (veloce, per QUESTA macchina). Per un binario da distribuire: make portable
 echo "  building (ARCH=${ARCH:-native})…"
-make -s glm ARCH="${ARCH:-native}"
+make -s glm hy3 ARCH="${ARCH:-native}"
 
 # 3) self-test sull'oracolo tiny, se presente
 if [ -d glm_tiny ] && [ -f ref_glm.json ]; then
     r=$(SNAP=./glm_tiny TF=1 ./glm 64 16 16 2>/dev/null | grep -oE "[0-9]+/[0-9]+ positions" || true)
-    echo "  engine self-test: ${r:-?}  (expected 32/32)"
+    echo "  glm self-test: ${r:-?}  (expected 32/32)"
+fi
+if [ -d hy3_tiny ] && [ -f ref_hy3.json ]; then
+    r=$(SNAP=./hy3_tiny TF=1 ./hy3 64 16 16 2>/dev/null | grep -oE "[0-9]+/[0-9]+ positions" || true)
+    echo "  hy3 self-test: ${r:-?}  (expected 32/32)"
 fi
 
 # 4) info macchina (la velocità dipende da QUESTI due numeri, non dalla GPU)

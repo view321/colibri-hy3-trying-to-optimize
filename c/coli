@@ -15,10 +15,12 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
 Configuration through environment variables or flags (also valid after the subcommand):
   COLI_MODEL=<dir>   model directory (default /home/vincenzo/glm52_i4)
+  COLI_PYTHON=<bin>  Python for convert/bench tools (needs numpy, torch, safetensors)
   --ram N            RAM budget in GB (automatically sizes the expert cache)
   --repin N          adapt RAM/VRAM experts every N tokens
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
+  --verbose          pass engine stderr through (or COLI_VERBOSE=1)
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap
 
@@ -31,7 +33,67 @@ if sys.platform == "win32":
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "tools")
 GLM  = os.path.join(HERE, "glm" + (".exe" if sys.platform == "win32" else ""))
+HY3  = os.path.join(HERE, "hy3" + (".exe" if sys.platform == "win32" else ""))
 DEF_MODEL = os.environ.get("COLI_MODEL", "/home/vincenzo/glm52_i4")
+
+def python_for_tools():
+    """Pick Python for offline tools (convert, bench). Needs numpy + torch + safetensors."""
+    override = os.environ.get("COLI_PYTHON")
+    if override and os.path.isfile(override):
+        return override
+    mio = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
+    if os.path.isfile(mio):
+        return mio
+    bindir = "Scripts" if sys.platform == "win32" else "bin"
+    for envkey in ("CONDA_PREFIX", "VIRTUAL_ENV"):
+        base = os.environ.get(envkey)
+        if not base:
+            continue
+        for name in ("python", "python3"):
+            cand = os.path.join(base, bindir, name)
+            if os.path.isfile(cand):
+                return cand
+    for cand in (sys.executable, shutil.which("python"), shutil.which("python3")):
+        if not cand or not os.path.isfile(cand):
+            continue
+        try:
+            subprocess.run([cand, "-c", "import numpy"], capture_output=True, check=True, timeout=15)
+            return cand
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            continue
+    return sys.executable
+
+def model_config(model):
+    path=os.path.join(model,"config.json")
+    if not os.path.isfile(path): return {}
+    try: return json.load(open(path,encoding="utf-8"))
+    except (OSError,json.JSONDecodeError): return {}
+
+def engine_for(model):
+    forced=os.environ.get("COLI_ENGINE","").lower()
+    if forced in ("hy3","glm"): return HY3 if forced=="hy3" else GLM
+    cfg=model_config(model)
+    return HY3 if cfg.get("model_type")=="hy_v3" else GLM
+
+def engine_name(model):
+    return "hy3" if engine_for(model)==HY3 else "glm"
+
+def model_config(model):
+    try:
+        with open(os.path.join(model, "config.json")) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def is_hy3_repo(repo):
+    if os.path.isdir(repo):
+        return model_config(repo).get("model_type") == "hy_v3"
+    r = repo.lower()
+    return "hy3" in r or repo.startswith("tencent/Hy")
+
+def engine_argv(model, cap):
+    """Hy3 int4 containers need explicit ebits/dbits; GLM auto-detects from shard layout."""
+    return [str(cap), "4", "8"] if engine_for(model) == HY3 else [str(cap)]
 END   = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 
@@ -78,12 +140,33 @@ def sprite_lines():
         out.append(row+"\033[0m")
     return out
 
-def banner(sub=""):
+def model_tag(model=None):
+    tier="streaming CPU"
+    if model and os.path.isdir(model):
+        try:
+            with open(os.path.join(model,"config.json")) as f:
+                cfg=json.load(f)
+            if cfg.get("model_type")=="hy_v3":
+                if cuda_binary(HY3): tier="streaming CPU+GPU"
+                return f"{C.gray}Hy3 · 295B MoE · int4 · {tier}{C.r}"
+        except (OSError,json.JSONDecodeError): pass
+    if cuda_binary(GLM): tier="streaming CPU+GPU"
+    return f"{C.gray}GLM-5.2 · 744B MoE · int4 · {tier}{C.r}"
+
+def engine_label(model=None):
+    if model and os.path.isdir(model):
+        try:
+            with open(os.path.join(model,"config.json")) as f:
+                if json.load(f).get("model_type")=="hy_v3": return "Hy3 295B"
+        except (OSError,json.JSONDecodeError): pass
+    return "GLM-5.2 744B"
+
+def banner(sub="", model=None):
     sp=sprite_lines()
     txt=[
         f"{C.teal}{C.b}colibrì{C.r} {C.dim}v1.0{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
-        f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
+        model_tag(model),
         f"{C.dgray}{sub}{C.r}" if sub else "",
         "",
     ]
@@ -103,13 +186,15 @@ def need_model(model):
         sys.exit(f"{C.yel}model not found:{C.r} {model}\n  set COLI_MODEL or use --model")
     if not os.path.exists(os.path.join(model,"tokenizer.json")):
         sys.exit(f"{C.yel}tokenizer.json is missing from {model}{C.r}")
-    if not os.path.exists(GLM):
-        sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
+    eng=engine_for(model)
+    if not os.path.exists(eng):
+        sys.exit(f"{C.yel}engine is not built ({os.path.basename(eng)}).{C.r} Run: coli build")
 
-def cuda_binary():
-    if not os.path.exists(GLM) or sys.platform != "linux": return False
+def cuda_binary(engine=None):
+    engine=engine or GLM
+    if not os.path.exists(engine) or sys.platform != "linux": return False
     try:
-        linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+        linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
         return any("libcudart" in line and "not found" not in line
                    for line in linked.stdout.splitlines())
     except (OSError,subprocess.SubprocessError): return False
@@ -127,6 +212,8 @@ def resource_request(a, env):
 
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
+    if engine_for(a.model) == HY3 and "IDOT" not in e:
+        e["IDOT"] = "0"  # Hy3 int8/int4 IDOT path not yet oracle-clean
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
@@ -150,7 +237,7 @@ def env_for(a):
             plan=build_plan(a.model,ram,ctx,devices,vram)
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
-        has_cuda=cuda_binary()
+        has_cuda=cuda_binary(engine_for(a.model))
         e=environment_for_plan(plan,e,has_cuda)
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
         gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
@@ -264,6 +351,22 @@ class Spinner:
         if self.th: self.th.join(timeout=0.4)
         if TTY: sys.stdout.write("\r\033[K"); sys.stdout.flush()
 
+def verbose_chat(a):
+    return getattr(a, "verbose", False) or os.environ.get("COLI_VERBOSE") == "1"
+
+def tail_errlog(path, max_lines=40, max_chars=4000):
+    try:
+        with open(path) as f:
+            text = f.read()[-max_chars:]
+        lines = [l for l in text.splitlines() if l.strip()]
+        if not lines:
+            return
+        print(f"\n  {C.yel}engine stderr (last {min(len(lines), max_lines)} lines):{C.r}")
+        for l in lines[-max_lines:]:
+            print(f"  {C.dgray}{l}{C.r}")
+    except OSError:
+        pass
+
 def stream_turn(p, sentinel, on_bytes):
     """legge fino alla sentinella; on_bytes riceve i chunk della risposta. Poi legge la riga STAT."""
     pend=b""
@@ -284,7 +387,7 @@ def stream_turn(p, sentinel, on_bytes):
 # ---------- comandi ----------
 def cmd_build(a):
     banner("build")
-    sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
+    sys.exit(subprocess.call(["make","-C",HERE,"glm","hy3"]))
 
 def cmd_info(a):
     banner("info")
@@ -294,7 +397,7 @@ def cmd_info(a):
         c=json.load(open(cfgp))
         row("model", a.model)
         row("arch", f"hidden {c.get('hidden_size')} · {c.get('num_hidden_layers')} layer · "
-                    f"{c.get('n_routed_experts')} expert/layer · top-{c.get('num_experts_per_tok')}")
+                    f"{c.get('num_experts', c.get('n_routed_experts'))} expert/layer · top-{c.get('num_experts_per_tok')}")
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
@@ -311,7 +414,8 @@ def cmd_info(a):
         row("disk", f"{fs.free/1e9:.0f} GB free")
     except OSError:
         row("disk", "? GB (unavailable)")
-    row("engine", "ready ✓" if os.path.exists(GLM) else "not built (coli build)")
+    eng=engine_for(a.model)
+    row("engine", f"{engine_name(a.model)} {'ready ✓' if os.path.exists(eng) else 'not built (coli build)'}")
     knobs=[]
     if a.ram: knobs.append(f"ram {a.ram}GB")
     if a.topp: knobs.append(f"topp {a.topp}")
@@ -348,33 +452,44 @@ def cmd_doctor(a):
                 "plan":None}
         print(json.dumps(report,indent=2) if a.json else format_doctor(report))
         return 2
-    report=run_doctor(a.model,ram,ctx,devices,vram,engine_path=GLM)
+    report=run_doctor(a.model,ram,ctx,devices,vram,engine_path=engine_for(a.model))
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
     return exit_code(report)
 
 def cmd_run(a):
     need_model(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
-    banner("run")
-    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink)
-    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
-    sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
+    eng=engine_for(a.model)
+    banner("run", a.model)
+    e=env_for(a)
+    if eng==HY3:
+        e["PROMPT"]=prompt
+        e["CHAT_TEMPLATE"]="0"
+    else:
+        e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
+    sys.exit(subprocess.call([eng, *engine_argv(a.model, a.cap)], env=e))
 
 def cmd_chat(a):
     need_model(a.model)
-    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}")
-    errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False)
+    banner(f"chat · {os.path.basename(a.model)} · ram {a.ram or '-'}GB · topp {a.topp or 'off'}", a.model)
+    eng=engine_for(a.model)
+    verbose=verbose_chat(a)
+    errlog=tempfile.NamedTemporaryFile(mode="w+", suffix=".log", delete=False) if not verbose else None
     e=env_for(a); e["SERVE"]="1"
-    p=subprocess.Popen([GLM,str(a.cap)], env=e, stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE, stderr=errlog, bufsize=0)
-    sp=Spinner("waking the giant (744B)…"); sp.start()
+    p=subprocess.Popen([eng, *engine_argv(a.model, a.cap)], env=e, stdin=subprocess.PIPE,
+                       stdout=subprocess.PIPE,
+                       stderr=sys.stderr if verbose else errlog, bufsize=0)
+    sp=Spinner(f"waking the giant ({engine_label(a.model)})…"); sp.start()
     st=stream_turn(p, READY, lambda b: None)
     sp.stop()
     if st is None:
-        errlog.seek(0); print(errlog.read()[-1500:]); sys.exit("the engine exited while loading")
-    errlog.flush()
+        if not verbose:
+            errlog.seek(0); print(errlog.read()[-1500:])
+        sys.exit("the engine exited while loading")
+    if not verbose:
+        errlog.flush()
     try:
-        elog=open(errlog.name).read()
+        elog=open(errlog.name).read() if not verbose else ""
         mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB", elog)
         if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
@@ -423,7 +538,9 @@ def cmd_chat(a):
             print(f"\n  {C.teal}◆ colibrì{C.r}")
             dec=codecs.getincrementaldecoder("utf-8")("replace")
             state={"first":True}
-            def prefill_tick(path=errlog.name):
+            def prefill_tick(path=None if verbose else errlog.name):
+                if not path:
+                    return ""
                 try:
                     with open(path) as f:
                         f.seek(max(0, os.path.getsize(path)-1500)); tail=f.read()
@@ -445,7 +562,10 @@ def cmd_chat(a):
             st=stream_turn(p, END, echo)
             if not raw: md.close()
             sp2.stop()
-            if st is None: print(f"\n  {C.yel}[engine terminated]{C.r}"); break
+            if st is None:
+                if not verbose:
+                    tail_errlog(errlog.name)
+                print(f"\n  {C.yel}[engine terminated]{C.r}"); break
             el=time.time()-t0
             if st.get("tok"):
                 print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
@@ -459,23 +579,25 @@ def cmd_chat(a):
     finally:
         try: p.stdin.close(); p.terminate()
         except Exception: pass
-        try: os.unlink(errlog.name)
-        except Exception: pass
+        if errlog:
+            try: os.unlink(errlog.name)
+            except Exception: pass
     print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
 def cmd_serve(a):
     need_model(a.model)
-    from openai_server import serve
-    serve(a.model, a.host, a.port, a.model_id, a.api_key,
-          a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+    eng=engine_for(a.model)
+    from openai_server import serve, default_model_id
+    model_id=a.model_id or os.environ.get("COLI_MODEL_ID") or default_model_id(a.model)
+    serve(a.model, a.host, a.port, model_id, a.api_key,
+          a.cap,a.ngen,eng,env_for(a),a.cors_origin,
           a.max_queue,a.queue_timeout,a.kv_slots)
 
 def cmd_bench(a):
     need_model(a.model)
     banner("bench")
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
-    py = venv_py if os.path.exists(venv_py) else sys.executable
+    py = python_for_tools()
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
     # dataset mancanti -> li scarica una volta (fetch_benchmarks.py li mette in --data come JSONL)
     missing=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
@@ -492,19 +614,23 @@ def cmd_bench(a):
 
 def cmd_convert(a):
     banner("convert")
-    # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
-    py = venv_py if os.path.exists(venv_py) else sys.executable
-    base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
-          "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
+    py = python_for_tools()
+    is_hy3 = is_hy3_repo(a.repo)
+    script = "convert_hy3.py" if is_hy3 else "convert_fp8_to_int4.py"
+    local = os.path.isdir(a.repo) and os.path.exists(os.path.join(a.repo, "config.json"))
+    n_layers = str(model_config(a.repo).get("num_hidden_layers", 80 if is_hy3 else 78)) if local else ("80" if is_hy3 else "78")
+    base=[py, os.path.join(TOOLS, script),
+          "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
+          "--n-layers", n_layers]
+    if local:
+        base += ["--indir", os.path.abspath(a.repo)]
+    else:
+        base += ["--repo", a.repo]
     if a.xbits: base+=["--xbits",str(a.xbits)]
-    # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.
-    print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
+    print(f"  {C.dim}[1/2] model ({script}): {' '.join(base)}{C.r}")
     rc=subprocess.call(base)
     if rc!=0: sys.exit(rc)
     if a.no_mtp: sys.exit(0)
-    # passo 2: testa MTP (layer 78). SEMPRE int8: a int4 i draft sbagliano quasi sempre
-    # (acceptance 0-4% vs 39-59%, misurato — issue #8) e la speculazione non parte mai.
     mtp_cmd=list(base); i=mtp_cmd.index("--ebits"); mtp_cmd[i+1]=str(max(8,a.ebits))
     print(f"  {C.dim}[2/2] int8 MTP head (speculative drafts){C.r}")
     sys.exit(subprocess.call(mtp_cmd+["--mtp"]))
@@ -520,6 +646,8 @@ def main():
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
+    common.add_argument("--verbose", action="store_true",
+                        help="pass engine stderr through (or set COLI_VERBOSE=1)")
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
@@ -531,7 +659,7 @@ def main():
     sub.add_parser("chat", parents=[common])
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
-    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
+    ps.add_argument("--model-id",default=None)
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
     ps.add_argument("--cors-origin",action="append",default=None)
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
