@@ -409,9 +409,12 @@ def stream_turn(p, sentinel, on_bytes):
         if pend.endswith(sentinel):
             rest=pend[:-len(sentinel)]
             if rest: on_bytes(rest)
-            line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss
-            m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)", line)
-            return {"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))} if m else {}
+            line=p.stdout.readline().decode("utf-8","replace").strip()   # STAT tok tps hit rss [prompt truncated decode_tps]
+            m=re.match(r"STAT (\S+) (\S+) (\S+) (\S+)(?: (\S+) (\S+) (\S+))?", line)
+            if not m: return {}
+            st={"tok":int(m.group(1)),"tps":float(m.group(2)),"hit":float(m.group(3)),"rss":float(m.group(4))}
+            if m.group(7) is not None: st["decode_tps"]=float(m.group(7))
+            return st
         if len(pend)>len(sentinel):
             out=pend[:-len(sentinel)]; pend=pend[-len(sentinel):]
             on_bytes(out)
@@ -624,7 +627,10 @@ def cmd_chat(a):
                 print(f"\n  {C.yel}[engine terminated]{C.r}"); break
             el=time.time()-t0
             if st.get("tok"):
-                print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
+                rate=f"{st['tps']:.2f} tok/s"
+                if st.get("decode_tps") is not None:
+                    rate=f"{st['tps']:.2f} tok/s total · {st['decode_tps']:.2f} tok/s decode"
+                print(f"\r  {C.dgray}└─ {st['tok']} tok · {rate} · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
                 if st["tok"]>=a.ngen:
                     print(f"  {C.yel}…stopped at --ngen ({a.ngen}); type :more to continue the response{C.r}")
                 print()

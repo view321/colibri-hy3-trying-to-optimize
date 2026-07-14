@@ -69,6 +69,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *c
                                const float *latent,const float *rope,int H,int Q,
                                int R,int V,int K,int T,float attention_scale);
 
+/* GQA decode/prefill attention: ctx[S,H,hd] from q[S,H,hd] and float K/V caches. */
+COLI_CUDA_DLLEXPORT int coli_cuda_gqa_attention(float *ctx, const float *q,
+                            const float *k_cache, const float *v_cache,
+                            int S, int H, int Hkv, int hd, int st0, int pos_base,
+                            int max_t, int device);
+
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);

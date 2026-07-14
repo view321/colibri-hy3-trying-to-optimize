@@ -58,6 +58,25 @@ LDFLAGS = -lm -fopenmp
 EXE     =
 endif
 
+# Optional io_uring async expert reads (PIPE=2). Set IOURING_PREFIX to a liburing
+# install prefix, or IOURING=1 to auto-probe /usr and /tmp/liburing-install.
+IOURING       ?= 0
+IOURING_PREFIX ?=
+IOURING_CFLAGS  =
+IOURING_LDFLAGS =
+ifeq ($(IOURING),1)
+ifneq ($(IOURING_PREFIX),)
+IOURING_CFLAGS  = -DCOLI_IOURING -I$(IOURING_PREFIX)/include
+IOURING_LDFLAGS = -L$(IOURING_PREFIX)/lib -luring
+else ifneq ($(wildcard /tmp/liburing-install/include/liburing.h),)
+IOURING_CFLAGS  = -DCOLI_IOURING -I/tmp/liburing-install/include
+IOURING_LDFLAGS = -L/tmp/liburing-install/lib -Wl,-rpath,/tmp/liburing-install/lib -luring
+else ifneq ($(wildcard /usr/include/liburing.h),)
+IOURING_CFLAGS  = -DCOLI_IOURING
+IOURING_LDFLAGS = -luring
+endif
+endif
+
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
 # pure C and keeps the original zero-dependency runtime.
 #
@@ -156,7 +175,7 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	./backend_cuda_test$(EXE)
 
 hy3$(EXE): hy3.c st.h json.h compat.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) hy3.c $(CUDA_OBJ) -o hy3$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(IOURING_CFLAGS) hy3.c $(CUDA_OBJ) -o hy3$(EXE) $(LDFLAGS) $(IOURING_LDFLAGS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }

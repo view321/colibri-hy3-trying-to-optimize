@@ -103,8 +103,13 @@ Works on 16 GB RAM; experts matmul on CPU. Slower decode, same memory story.
 | **`PIN_GB=N`** | Cap manual/autopin hot store size in GB. |
 | **`REPIN=N`** | Live swap of cold VRAM/RAM pins every N emitted tokens. |
 | **`CUDA_DENSE=1`** | Upload resident dense tensors to GPU (small win on Hy3: 1 dense layer). |
+| **`CUDA_ATTN=1`** | Run GQA attention on GPU during decode (float KV only; incompatible with `KV_I8=1`). |
 | **`DIRECT=1`** | `O_DIRECT` disk reads on NVMe. |
-| **`PIPE=1`** | Async expert prefetch (helps when cache is small). |
+| **`PIPE=1`** | Async expert prefetch via thread pool (helps when cache is small). |
+| **`PIPE=2`** | io_uring expert reads (needs `make hy3 IOURING=1`; falls back to `PIPE=1`). |
+| **`KV_I8=1`** | int8 KV cache (~4× smaller KV RAM; float in-flight row for current position). |
+| **`PERF=1`** | Every 100 emitted tokens, print `[perf] attn=…% disk=…% expert_mm=…% head=…%` on stderr. |
+| **`TREE_DRAFT=1`** | Tree MTP speculative decode (needs `out-mtp-*.safetensors`; default linear draft otherwise). |
 | **`--verbose`** | Show `[CUDA]` / `[PIN]` / `[RAM_GB]` engine lines in the terminal. |
 
 **Trade-offs on 16 GB RAM:** smaller `--ram` → fewer LRU slots and fewer pinned experts → more disk reads per token → slower, but peak RSS stays near **~10–14 GB** instead of 50+ GB. Pair with GPU VRAM so the experts you *do* pin run matmul on the card during **decode** (not during prefill layer progress).
@@ -201,7 +206,9 @@ Hy3 cold decode reads **~5–6 GB of experts per token** from disk (79 MoE layer
 | Warm cache | ~0.1–0.3 tok/s | ~0.2–0.5 tok/s |
 | Same chat session, turn 2+ | faster as `.coli_usage` + LRU warm up | often several× faster |
 
-Tuning: `--ram` sizes the cache budget; `--vram` + `--gpu` move hot experts to the card; autopin/PIN from `.coli_usage`; `DIRECT=1` on NVMe; optional `PIPE=1`.
+Tuning: `--ram` sizes the cache budget; `--vram` + `--gpu` move hot experts to the card; autopin/PIN from `.coli_usage`; `DIRECT=1` on NVMe; `PIPE=1` or `PIPE=2` (io_uring); optional `CUDA_ATTN=1`, `KV_I8=1`, `PERF=1`.
+
+**Throughput numbers:** mid-stream `[t=N] … tok/s` and the chat footer’s **decode** rate measure generation only (from first emitted token). The footer’s **total** rate includes prefill for that turn (full prompt on turn 1, incremental new tokens on follow-ups). Example: `└─ 38 tok · 0.10 tok/s total · 0.24 tok/s decode · …`.
 
 ### CUDA expert tier (optional)
 
@@ -210,17 +217,19 @@ Same three-tier model as GLM: **disk → RAM → VRAM**. Hot pinned experts can 
 ```bash
 cd c
 make hy3 CUDA=1                    # requires nvcc + NVIDIA driver
+make hy3 CUDA=1 IOURING=1          # + io_uring for PIPE=2 expert loads
 
 # lean: 16 GB system RAM + 16 GB GPU
 COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 12 --gpu 0 --vram 14 --auto-tier
 
-# fast: large RAM cache + GPU
-COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 56 --gpu 0 --vram 16 --auto-tier
+# fast: large RAM cache + GPU + optional perf knobs
+COLI_VERBOSE=1 DIRECT=1 PIPE=2 CUDA_ATTN=1 \
+  COLI_MODEL=/path/to/hy3_i4 ./coli chat --ram 56 --gpu 0 --vram 14 --auto-tier --verbose
 ```
 
 Or set env vars directly: `COLI_CUDA=1`, `COLI_GPU=0`, `CUDA_EXPERT_GB=14`, plus autopin from `.coli_usage`.
 At startup, confirm you see `[CUDA] hot expert tier: N experts, VRAM … GB` — if that line is missing, CUDA is not active (rebuild with `CUDA=1` and pass `--gpu` / `--vram`).
-Optional `CUDA_DENSE=1` uploads resident dense weights to GPU; `REPIN=N` swaps cold VRAM pins for hot experts during chat.
+Optional `CUDA_DENSE=1` uploads resident dense weights to GPU (uses VRAM; leaves less room for expert tier). `CUDA_ATTN=1` offloads GQA attention to GPU (best with float KV; do not combine with `KV_I8=1`). `REPIN=N` swaps cold VRAM pins for hot experts during chat.
 
 ## OpenAI-compatible API
 
@@ -259,7 +268,8 @@ Same idea as [GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibr
 - FP8 → int4 conversion (full 80-layer model)
 - `hy3_tiny` oracle **32/32** (committed); `hy3_tiny_i4` oracle **32/32** (regenerate locally)
 - Full-model chat (coherent output with `IDOT=0`, fixed serve KV alloc)
-- MTP speculative decode (auto-enabled when `out-mtp-*.safetensors` present; `DRAFT=3` default)
+- MTP speculative decode (auto-enabled when `out-mtp-*.safetensors` present; `DRAFT=3` default; optional `TREE_DRAFT=1`)
+- Performance knobs: AVX2 attention, `KV_I8=1` int8 KV, `PERF=1` breakdown, `PIPE=2` io_uring loads, `CUDA_ATTN=1` GPU attention
 - `coli chat` / `coli serve` / `coli convert` / `coli plan` / `coli doctor`
 
 **Not yet**
@@ -273,6 +283,10 @@ Same idea as [GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibr
 cd c && make hy3
 # optional CUDA build (Linux + nvcc):
 make hy3 CUDA=1
+# optional io_uring expert loads (PIPE=2):
+make hy3 IOURING=1
+# both:
+make hy3 CUDA=1 IOURING=1
 # optional self-test (requires hy3_tiny/ — see Tiny oracle fixtures):
 SNAP=./hy3_tiny TF=1 ./hy3 64 16 16
 # MTP smoke test (full converted weights with out-mtp-*.safetensors):

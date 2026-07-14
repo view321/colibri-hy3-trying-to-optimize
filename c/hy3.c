@@ -18,9 +18,13 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <unistd.h>
+#include <errno.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #include <sys/mman.h>
+#endif
+#if defined(__linux__) && defined(COLI_IOURING)
+#include <liburing.h>
 #endif
 #include "st.h"
 #include "json.h"
@@ -38,8 +42,64 @@ static inline float hsum256(__m256 v){
     lo=_mm_add_ps(lo,hi); __m128 sh=_mm_movehl_ps(lo,lo); lo=_mm_add_ps(lo,sh);
     sh=_mm_shuffle_ps(lo,lo,1); lo=_mm_add_ss(lo,sh); return _mm_cvtss_f32(lo);
 }
+static inline float dot_avx2(const float *a, const float *b, int n){
+    __m256 acc=_mm256_setzero_ps(); int i=0;
+    for(;i+8<=n;i+=8) acc=_mm256_fmadd_ps(_mm256_loadu_ps(a+i), _mm256_loadu_ps(b+i), acc);
+    float s=hsum256(acc);
+    for(;i<n;i++) s+=a[i]*b[i];
+    return s;
+}
+static inline void axpy_avx2(float *y, const float *x, float w, int n){
+    __m256 wv=_mm256_set1_ps(w); int i=0;
+    for(;i+8<=n;i+=8){
+        __m256 yv=_mm256_loadu_ps(y+i);
+        yv=_mm256_fmadd_ps(_mm256_loadu_ps(x+i), wv, yv);
+        _mm256_storeu_ps(y+i, yv);
+    }
+    for(;i<n;i++) y[i]+=w*x[i];
+}
+static inline float dot_f_i8(const float *a, const int8_t *b, int n){
+    float s=0; int i=0;
+#ifdef __AVX2__
+    __m256 acc=_mm256_setzero_ps();
+    for(;i+8<=n;i+=8){
+        __m256i wi=_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(b+i)));
+        acc=_mm256_fmadd_ps(_mm256_loadu_ps(a+i), _mm256_cvtepi32_ps(wi), acc);
+    }
+    s=hsum256(acc);
+#endif
+    for(;i<n;i++) s+=a[i]*(float)b[i];
+    return s;
+}
+static inline void axpy_f_i8(float *y, const int8_t *x, float w, int n){
+    int i=0;
+#ifdef __AVX2__
+    __m256 wv=_mm256_set1_ps(w);
+    for(;i+8<=n;i+=8){
+        __m256i wi=_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(x+i)));
+        __m256 yv=_mm256_loadu_ps(y+i);
+        yv=_mm256_fmadd_ps(_mm256_cvtepi32_ps(wi), wv, yv);
+        _mm256_storeu_ps(y+i, yv);
+    }
+#endif
+    for(;i<n;i++) y[i]+=w*(float)x[i];
+}
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
+#ifndef __AVX2__
+static inline float dot_avx2(const float *a, const float *b, int n){
+    float s=0; for(int i=0;i<n;i++) s+=a[i]*b[i]; return s;
+}
+static inline void axpy_avx2(float *y, const float *x, float w, int n){
+    for(int i=0;i<n;i++) y[i]+=w*x[i];
+}
+static inline float dot_f_i8(const float *a, const int8_t *b, int n){
+    float s=0; for(int i=0;i<n;i++) s+=a[i]*(float)b[i]; return s;
+}
+static inline void axpy_f_i8(float *y, const int8_t *x, float w, int n){
+    for(int i=0;i<n;i++) y[i]+=w*(float)x[i];
+}
 #endif
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -90,6 +150,8 @@ typedef struct {
     QT embed, lm_head; float *final_norm;
     Layer *L;
     float **K, **V; int max_t;
+    int8_t **Kq, **Vq;
+    float **Kscale, **Vscale;
     int *kv_start;                               /* prima pos valida nella KV (MTP: parziale) */
     ESlot **ecache; int *ecn; int ecap;
     ESlot **pin; int *npin;
@@ -106,12 +168,17 @@ typedef struct {
     uint64_t n_fw, n_emit;
     int64_t resident_bytes;
     double t_edisk, t_emm, t_attn, t_head;
+    uint8_t *attn_vis;                           /* TREE_DRAFT: mask [S][max_t] flattened */
+    int attn_vis_s;
 } Model;
+
+static void perf_report(Model *m);
 
 #ifdef COLI_CUDA
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static int g_cuda_dense;
+static int g_cuda_attn;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -269,6 +336,7 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 }
 
 static int g_idot=1, g_i4s=2, g_nopack=0, g_drop=0, g_direct=0;
+static int g_perf=0, g_kv_i8=0, g_tree_draft=0;
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float s=amax/127.f; if(s<1e-12f)s=1e-12f; float inv=1.f/s;
@@ -584,7 +652,27 @@ static void embed_row(Model *m, int tok, float *x){
     for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
 }
 
-static void expert_load(Model *m, int layer, int eid, ESlot *s){
+static void expert_finalize(Model *m, int layer, int eid, ESlot *s,
+        st_tensor *tw[3], st_tensor *tq[3], const int ord[3], const int64_t pos[3]){
+    Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden;
+    int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
+    if(g_drop){
+        posix_fadvise(tw[ord[0]]->fd,tw[ord[0]]->off,wtot,POSIX_FADV_DONTNEED);
+        for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd,tq[k]->off,tq[k]->nbytes,POSIX_FADV_DONTNEED);
+    }
+    float *fp[3]; int64_t fo=0;
+    for(int k=0;k<3;k++){ fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
+    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
+    for(int k=0;k<3;k++){
+        int64_t nb=tw[k]->nbytes;
+        int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
+        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+    }
+    s->eid=eid; (void)layer; (void)m;
+}
+
+static int expert_load(Model *m, int layer, int eid, ESlot *s){
 #ifdef COLI_CUDA
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
@@ -596,7 +684,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
-        s->eid=eid; return;
+        s->eid=eid; return 1;
     }
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
@@ -638,26 +726,148 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
             if(pread(tw[k]->fd,s->slab+o,tw[k]->nbytes,tw[k]->off)!=tw[k]->nbytes){perror("pread expert");exit(1);}
             pos[k]=o; o+=tw[k]->nbytes; }
     }
-    float *fp[3]; int64_t fo=0;
+    int64_t fo=0;
     for(int k=0;k<3;k++){
         if(pread(tq[k]->fd,(char*)(s->fslab+fo),tq[k]->nbytes,tq[k]->off)!=tq[k]->nbytes){perror("pread qs");exit(1);}
-        fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4;
+        fo+=tq[k]->nbytes/4;
     }
     if(g_drop){
         posix_fadvise(tw[ord[0]]->fd,tw[ord[0]]->off,wtot,POSIX_FADV_DONTNEED);
         for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd,tq[k]->off,tq[k]->nbytes,POSIX_FADV_DONTNEED);
     }
-    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
-    for(int k=0;k<3;k++){
-        int64_t nb=tw[k]->nbytes;
-        int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
-        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
-        qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
-    }
-    s->eid=eid;
+    expert_finalize(m,layer,eid,s,tw,tq,ord,pos);
+    return 1;
 }
 
 static int g_pipe=0, g_pipe_nw=8;
+
+#if defined(__linux__) && defined(COLI_IOURING)
+typedef struct {
+    ESlot *slot; Model *m; int layer, eid;
+    _Atomic int pending;
+    st_tensor *tw[3], *tq[3];
+    int ord[3]; int64_t pos[3];
+} ExpertIoJob;
+
+static struct { struct io_uring ring; int ok; ExpertIoJob jobs[64]; int njobs; } g_uring;
+
+static void uring_on_cqe(ExpertIoJob *job, int res){
+    if(res<0){ fprintf(stderr,"io_uring read failed: %s\n",strerror(-res)); exit(1); }
+    if(atomic_fetch_sub_explicit(&job->pending,1,memory_order_acq_rel)==1)
+        expert_finalize(job->m,job->layer,job->eid,job->slot,job->tw,job->tq,job->ord,job->pos);
+}
+
+static void uring_pipe_init(void){
+    if(g_uring.ok) return;
+    int r=io_uring_queue_init(4096,&g_uring.ring,0);
+    if(r<0){ fprintf(stderr,"[PIPE] io_uring_queue_init: %s, falling back to thread pool\n",strerror(-r)); g_pipe=1; return; }
+    g_uring.ok=1;
+    fprintf(stderr,"[PIPE] io_uring async expert load enabled (PIPE=2)\n");
+}
+
+static void uring_sqe_read(ExpertIoJob *job, int fd, void *buf, size_t len, off_t off){
+    for(int tries=0;;tries++){
+        struct io_uring_sqe *sqe=io_uring_get_sqe(&g_uring.ring);
+        if(sqe){
+            io_uring_prep_read(sqe,fd,buf,len,off);
+            io_uring_sqe_set_data(sqe,job);
+            atomic_fetch_add_explicit(&job->pending,1,memory_order_relaxed);
+            return;
+        }
+        io_uring_submit(&g_uring.ring);
+        struct io_uring_cqe *cqe;
+        if(io_uring_wait_cqe(&g_uring.ring,&cqe)==0){
+            ExpertIoJob *cj=(ExpertIoJob*)io_uring_cqe_get_data(cqe);
+            uring_on_cqe(cj,cqe->res);
+            io_uring_cqe_seen(&g_uring.ring,cqe);
+        }
+        if(tries>16384){
+            fprintf(stderr,"io_uring_get_sqe failed: ring saturated (layer=%d eid=%d)\n",
+                job->layer,job->eid);
+            exit(1);
+        }
+    }
+}
+
+static void uring_pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
+    g_uring.njobs=njobs;
+    for(int q=0;q<njobs;q++){
+        ExpertIoJob *job=&g_uring.jobs[q];
+        ESlot *s=&m->ws[q]; int eid=eids[q];
+#ifdef COLI_CUDA
+        if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+#endif
+        memset(job,0,sizeof(*job));
+        job->slot=s; job->m=m; job->layer=layer; job->eid=eid;
+        atomic_store_explicit(&job->pending,0,memory_order_relaxed);
+        Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
+        char nm[3][288], qs[3][320]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
+        for(int k=0;k<3;k++){
+            snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+            snprintf(qs[k],sizeof(qs[k]),"%.*s.qs",(int)(sizeof(nm[k])-1),nm[k]);
+        }
+        if(!st_has(&m->S,qs[0])){
+            qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
+            qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
+            qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
+            s->eid=eid; continue;
+        }
+        for(int k=0;k<3;k++){
+            job->tw[k]=st_find(&m->S,nm[k]);
+            job->tq[k]=st_find(&m->S,qs[k]);
+            if(!job->tw[k]||!job->tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); exit(1); }
+        }
+        int64_t wtot=job->tw[0]->nbytes+job->tw[1]->nbytes+job->tw[2]->nbytes;
+        int64_t ftot=(job->tq[0]->nbytes+job->tq[1]->nbytes+job->tq[2]->nbytes)/4;
+        if(!s->slab||wtot+8192>s->slab_cap){
+            compat_aligned_free(s->slab);
+            if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n");exit(1);}
+            s->slab_cap=wtot+8192;
+        }
+        if(!s->fslab||ftot>s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; }
+        for(int a=0;a<3;a++) job->ord[a]=a;
+        for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++)
+            if(job->tw[job->ord[bb]]->off<job->tw[job->ord[a]]->off){
+                int t=job->ord[a]; job->ord[a]=job->ord[bb]; job->ord[bb]=t; }
+        int contig=job->tw[job->ord[0]]->fd==job->tw[job->ord[1]]->fd
+            &&job->tw[job->ord[1]]->fd==job->tw[job->ord[2]]->fd
+            &&job->tw[job->ord[0]]->off+job->tw[job->ord[0]]->nbytes==job->tw[job->ord[1]]->off
+            &&job->tw[job->ord[1]]->off+job->tw[job->ord[1]]->nbytes==job->tw[job->ord[2]]->off;
+        if(contig){
+            int64_t off0=job->tw[job->ord[0]]->off;
+            uring_sqe_read(job,job->tw[job->ord[0]]->fd,s->slab,wtot,off0);
+            job->pos[job->ord[0]]=0;
+            job->pos[job->ord[1]]=job->tw[job->ord[0]]->nbytes;
+            job->pos[job->ord[2]]=job->tw[job->ord[0]]->nbytes+job->tw[job->ord[1]]->nbytes;
+        } else {
+            int64_t o=0;
+            for(int a=0;a<3;a++){ int k=job->ord[a];
+                uring_sqe_read(job,job->tw[k]->fd,s->slab+o,job->tw[k]->nbytes,job->tw[k]->off);
+                job->pos[k]=o; o+=job->tw[k]->nbytes; }
+        }
+        int64_t fo=0;
+        for(int k=0;k<3;k++){
+            uring_sqe_read(job,job->tq[k]->fd,(char*)(s->fslab+fo),job->tq[k]->nbytes,job->tq[k]->off);
+            fo+=job->tq[k]->nbytes/4;
+        }
+        if(atomic_load_explicit(&job->pending,memory_order_relaxed)==0)
+            expert_finalize(m,layer,eid,s,job->tw,job->tq,job->ord,job->pos);
+    }
+    io_uring_submit(&g_uring.ring);
+}
+
+static void uring_pipe_wait(int q){
+    ExpertIoJob *job=&g_uring.jobs[q];
+    while(atomic_load_explicit(&job->pending,memory_order_acquire)>0){
+        struct io_uring_cqe *cqe;
+        if(io_uring_wait_cqe(&g_uring.ring,&cqe)<0){ perror("io_uring_wait_cqe"); exit(1); }
+        ExpertIoJob *cj=(ExpertIoJob*)io_uring_cqe_get_data(cqe);
+        uring_on_cqe(cj,cqe->res);
+        io_uring_cqe_seen(&g_uring.ring,cqe);
+    }
+}
+#endif
+
 typedef struct {
     _Atomic uint64_t cur;
     _Atomic int njobs, eids[64], layer, ready[64];
@@ -688,6 +898,14 @@ static void *pipe_worker(void *arg){
     return NULL;
 }
 static void pipe_init(Model *m){
+    if(g_pipe==2){
+#if defined(__linux__) && defined(COLI_IOURING)
+        uring_pipe_init();
+        if(g_pipe==2) return;
+#endif
+        fprintf(stderr,"[PIPE] io_uring unavailable, using thread pool (PIPE=1)\n");
+        g_pipe=1;
+    }
     if(g_pp.started) return;
     g_pp.m=m; g_pp.nw=g_pipe_nw; if(g_pp.nw>16)g_pp.nw=16; if(g_pp.nw<1)g_pp.nw=1;
     atomic_store(&g_pp.cur,0); atomic_store(&g_pp.njobs,0);
@@ -696,6 +914,9 @@ static void pipe_init(Model *m){
     g_pp.started=1;
 }
 static void pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
+#if defined(__linux__) && defined(COLI_IOURING)
+    if(g_pipe==2){ uring_pipe_dispatch(m,layer,eids,njobs); return; }
+#endif
     g_pp.m=m;
     atomic_store_explicit(&g_pp.njobs,njobs,memory_order_relaxed);
     atomic_store_explicit(&g_pp.layer,layer,memory_order_relaxed);
@@ -706,6 +927,9 @@ static void pipe_dispatch(Model *m,int layer,const int *eids,int njobs){
     pthread_mutex_lock(&g_pp.mx); pthread_cond_broadcast(&g_pp.cv); pthread_mutex_unlock(&g_pp.mx);
 }
 static inline void pipe_wait(int q){
+#if defined(__linux__) && defined(COLI_IOURING)
+    if(g_pipe==2){ uring_pipe_wait(q); return; }
+#endif
     while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) sched_yield();
 }
 
@@ -868,14 +1092,40 @@ static void kv_alloc(Model *m, int max_t){
     int NR=c->n_layers+(m->has_mtp?1:0);
     if(m->K){ for(int i=0;i<NR;i++){ free(m->K[i]); free(m->V[i]); }
         free(m->K); free(m->V); m->K=m->V=NULL; }
+    if(m->Kq){ for(int i=0;i<NR;i++){ free(m->Kq[i]); free(m->Vq[i]); free(m->Kscale[i]); free(m->Vscale[i]); }
+        free(m->Kq); free(m->Vq); free(m->Kscale); free(m->Vscale);
+        m->Kq=NULL; m->Vq=NULL; m->Kscale=NULL; m->Vscale=NULL; }
     free(m->kv_start); m->kv_start=NULL;
     m->max_t=max_t;
-    m->K=calloc(NR,sizeof(float*)); m->V=calloc(NR,sizeof(float*));
     m->kv_start=calloc(NR,sizeof(int));
     int64_t slot=(int64_t)c->n_kv_heads*max_t*c->head_dim;
-    for(int i=0;i<NR;i++){
-        m->K[i]=falloc(slot); m->V[i]=falloc(slot);
-        m->kv_start[i]=(m->has_mtp && i==c->n_layers)?-1:0;
+    int64_t sc_slot=(int64_t)c->n_kv_heads*max_t;
+    if(g_kv_i8){
+        m->Kq=calloc(NR,sizeof(int8_t*)); m->Vq=calloc(NR,sizeof(int8_t*));
+        m->Kscale=calloc(NR,sizeof(float*)); m->Vscale=calloc(NR,sizeof(float*));
+        for(int i=0;i<NR;i++){
+            m->Kq[i]=malloc((size_t)slot); m->Vq[i]=malloc((size_t)slot);
+            m->Kscale[i]=falloc(sc_slot); m->Vscale[i]=falloc(sc_slot);
+            if(!m->Kq[i]||!m->Vq[i]){fprintf(stderr,"OOM kv i8\n");exit(1);}
+            m->kv_start[i]=(m->has_mtp && i==c->n_layers)?-1:0;
+        }
+    } else {
+        m->K=calloc(NR,sizeof(float*)); m->V=calloc(NR,sizeof(float*));
+        for(int i=0;i<NR;i++){
+            m->K[i]=falloc(slot); m->V[i]=falloc(slot);
+            m->kv_start[i]=(m->has_mtp && i==c->n_layers)?-1:0;
+        }
+    }
+}
+
+static inline void quantize_row_i8(const float *src, int8_t *dst, float *scale, int n){
+    float mx=1e-8f; for(int i=0;i<n;i++){ float a=fabsf(src[i]); if(a>mx) mx=a; }
+    float s=mx/127.0f; *scale=s;
+    float inv=1.0f/s;
+    for(int i=0;i<n;i++){
+        float v=src[i]*inv;
+        if(v>127.f) v=127.f; else if(v<-127.f) v=-127.f;
+        dst[i]=(int8_t)lrintf(v);
     }
 }
 
@@ -899,11 +1149,27 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *vv=Vp+(int64_t)s*Hkv*hd+(int64_t)kh*hd;
             rmsnorm_head(kk,kk,l->kn,hd,c->eps);
             rope_rotate_half(kk,pos,c->theta,hd);
-            memcpy(m->K[layer]+((int64_t)kh*m->max_t+pos)*hd,kk,(size_t)hd*sizeof(float));
-            memcpy(m->V[layer]+((int64_t)kh*m->max_t+pos)*hd,vv,(size_t)hd*sizeof(float));
+            if(g_kv_i8){
+                int64_t off=((int64_t)kh*m->max_t+pos)*hd;
+                int64_t soff=(int64_t)kh*m->max_t+pos;
+                quantize_row_i8(kk,m->Kq[layer]+off,m->Kscale[layer]+soff,hd);
+                quantize_row_i8(vv,m->Vq[layer]+off,m->Vscale[layer]+soff,hd);
+            } else {
+                memcpy(m->K[layer]+((int64_t)kh*m->max_t+pos)*hd,kk,(size_t)hd*sizeof(float));
+                memcpy(m->V[layer]+((int64_t)kh*m->max_t+pos)*hd,vv,(size_t)hd*sizeof(float));
+            }
         }
     }
     float *ctx=falloc(qsz);
+    int use_cuda=0;
+#ifdef COLI_CUDA
+    if(g_cuda_enabled&&g_cuda_attn&&!g_kv_i8&&m->K&&!m->attn_vis){
+        int st0=(m->kv_start&&m->kv_start[layer]>=0)?m->kv_start[layer]:0;
+        if(coli_cuda_gqa_attention(ctx,Q,m->K[layer],m->V[layer],S,H,Hkv,hd,st0,pos_base,m->max_t,g_cuda_devices[0]))
+            use_cuda=1;
+    }
+#endif
+    if(!use_cuda){
     #pragma omp parallel for collapse(2) schedule(static)
     for(int s=0;s<S;s++) for(int h=0;h<H;h++){
         int pos=pos_base+s, kvh=h/nrep;
@@ -911,20 +1177,49 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int st0=(m->kv_start && m->kv_start[layer]>=0)?m->kv_start[layer]:0;
         int nt=pos+1-st0;
         float sc[8192];
+        int nv=0;
         for(int jj=0;jj<nt;jj++){
             int t=st0+jj;
-            const float *kv=m->K[layer]+((int64_t)kvh*m->max_t+t)*hd;
-            float a=0; for(int d=0;d<hd;d++) a+=qv[d]*kv[d];
-            sc[jj]=a*scale;
+            if(m->attn_vis && !m->attn_vis[(int64_t)s*m->max_t+t]) continue;
+            if(g_kv_i8){
+                if(t==pos){
+                    const float *kv=Kp+(int64_t)s*Hkv*hd+(int64_t)kvh*hd;
+                    sc[nv]=dot_avx2(qv,kv,hd)*scale;
+                } else {
+                    int64_t off=((int64_t)kvh*m->max_t+t)*hd;
+                    int64_t soff=(int64_t)kvh*m->max_t+t;
+                    sc[nv]=m->Kscale[layer][soff]*dot_f_i8(qv,m->Kq[layer]+off,hd)*scale;
+                }
+            } else {
+                const float *kv=m->K[layer]+((int64_t)kvh*m->max_t+t)*hd;
+                sc[nv]=dot_avx2(qv,kv,hd)*scale;
+            }
+            nv++;
         }
-        softmax(sc,nt);
+        if(nv<1){ float *cx=ctx+(int64_t)s*H*hd+(int64_t)h*hd; for(int d=0;d<hd;d++) cx[d]=0; continue; }
+        softmax(sc,nv);
         float *cx=ctx+(int64_t)s*H*hd+(int64_t)h*hd;
         for(int d=0;d<hd;d++) cx[d]=0;
+        int vi=0;
         for(int jj=0;jj<nt;jj++){
             int t=st0+jj;
-            const float *vv=m->V[layer]+((int64_t)kvh*m->max_t+t)*hd;
-            float w=sc[jj]; for(int d=0;d<hd;d++) cx[d]+=w*vv[d];
+            if(m->attn_vis && !m->attn_vis[(int64_t)s*m->max_t+t]) continue;
+            if(g_kv_i8){
+                if(t==pos){
+                    const float *vv=Vp+(int64_t)s*Hkv*hd+(int64_t)kvh*hd;
+                    axpy_avx2(cx,vv,sc[vi],hd);
+                } else {
+                    int64_t off=((int64_t)kvh*m->max_t+t)*hd;
+                    int64_t soff=(int64_t)kvh*m->max_t+t;
+                    axpy_f_i8(cx,m->Vq[layer]+off,sc[vi]*m->Vscale[layer][soff],hd);
+                }
+            } else {
+                const float *vv=m->V[layer]+((int64_t)kvh*m->max_t+t)*hd;
+                axpy_avx2(cx,vv,sc[vi],hd);
+            }
+            vi++;
         }
+    }
     }
     matmul_qt(out,ctx,&l->o,S);
     m->t_attn+=now_s()-ta0;
@@ -1084,7 +1379,7 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
-    if(!m->K||pos_base+S>m->max_t) kv_alloc(m,pos_base+S+16);
+    if((!m->K && !m->Kq)||pos_base+S>m->max_t) kv_alloc(m,pos_base+S+16);
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m,ids[s],x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
@@ -1100,7 +1395,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
 /* come step(), ma ritorna i logits di TUTTE le S posizioni [S,vocab] (per la verifica spec) */
 static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
-    if(!m->K||pos_base+S>m->max_t) kv_alloc(m,pos_base+S+16);
+    if((!m->K && !m->Kq)||pos_base+S>m->max_t) kv_alloc(m,pos_base+S+16);
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m,ids[s],x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
@@ -1126,6 +1421,77 @@ static int ngram_draft(const int *ids, int len, int G, int *draft){
 static int mtp_argmax(const float *lo, int V){
     int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
 }
+
+static int mtp_one_forward(Model *m, int tok, int pos, float *logit){
+    Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
+    if(m->kv_start[li]<0||m->kv_start[li]>pos) m->kv_start[li]=pos;
+    float *x=falloc(D), *cat=falloc(2*D), *hx=falloc(D), *nrm=falloc(D), *tmp=falloc(D);
+    float *row=falloc(D), *h=falloc(D);
+    memcpy(h,m->hlast,D*sizeof(float));
+    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    embed_row(m,tok,x);
+    rmsnorm(x,x,m->enorm,D,c->eps);
+    if(!prenorm) rmsnorm(h,h,m->final_norm,D,c->eps);
+    rmsnorm(h,h,m->hnorm,D,c->eps);
+    if(getenv("MTP_SWAP")){ memcpy(cat,h,D*sizeof(float)); memcpy(cat+D,x,D*sizeof(float)); }
+    else { memcpy(cat,x,D*sizeof(float)); memcpy(cat+D,h,D*sizeof(float)); }
+    matmul_qt(hx,cat,&m->eh_proj,1);
+    layer_forward(m,&m->mtpL,li,hx,1,pos,nrm,tmp);
+    rmsnorm(row,hx,m->mtp_norm,D,c->eps);
+    matmul_qt(logit,row,&m->lm_head,1);
+    memcpy(m->hlast,hx,D*sizeof(float));
+    free(x); free(cat); free(hx); free(nrm); free(tmp); free(row); free(h);
+    return 1;
+}
+
+static void mtp_top2(const float *lo, int V, int *a, int *b){
+    int t0=0,t1=0; float v0=lo[0],v1=-1e30f;
+    for(int i=1;i<V;i++){
+        if(lo[i]>v0){v1=v0;t1=t0;v0=lo[i];t0=i;}
+        else if(lo[i]>v1){v1=lo[i];t1=i;}
+    }
+    *a=t0; *b=t1;
+}
+
+static int mtp_draft_tree(Model *m, int next_tok, int kv, int *nodes, int *parent){
+    Cfg *c=&m->c; int V=c->vocab;
+    float *logit=falloc(V);
+    int p=kv; if(p<0){ free(logit); return 0; }
+    mtp_one_forward(m,next_tok,p,logit);
+    int r0,r1; mtp_top2(logit,V,&r0,&r1);
+    nodes[0]=r0; nodes[1]=r1; parent[0]=parent[1]=-1;
+    int n=2;
+    for(int ri=0;ri<2;ri++){
+        int root=nodes[ri], pos=p+1+ri;
+        mtp_one_forward(m,root,pos,logit);
+        int c0,c1; mtp_top2(logit,V,&c0,&c1);
+        nodes[n]=c0; parent[n]=ri; n++;
+        nodes[n]=c1; parent[n]=ri; n++;
+    }
+    free(logit);
+    return n;
+}
+
+static void build_tree_attn_mask(Model *m, int kv, int S, const int *parent){
+    if(!m->attn_vis) m->attn_vis=calloc((size_t)S*m->max_t,1);
+    memset(m->attn_vis,0,(size_t)S*m->max_t);
+    m->attn_vis_s=S;
+    for(int s=0;s<S;s++){
+        for(int t=0;t<=kv;t++) m->attn_vis[(int64_t)s*m->max_t+t]=1;
+        int pos=kv+1+s;
+        for(int a=s;;){
+            int pt=kv+1+a;
+            if(pt<=pos) m->attn_vis[(int64_t)s*m->max_t+pt]=1;
+            if(a<0) break;
+            a=parent[a];
+        }
+    }
+}
+
+static void clear_tree_attn_mask(Model *m){
+    free(m->attn_vis); m->attn_vis=NULL; m->attn_vis_s=0;
+}
+
 static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
     int p=kv-1; if(p<0||G<1) return 0;
@@ -1201,6 +1567,7 @@ static void emit_stream(int t, void *ud){
         fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  %.2f tok/fw]\n",e->count,
             rss_gb(),tt?100.0*e->m->hits/tt:0.0,e->count/(now_s()-e->t0),
             e->m->n_fw?(double)e->count/e->m->n_fw:1.0); }
+    if(g_perf && e->count%100==0) perf_report(e->m);
 }
 
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
@@ -1220,6 +1587,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0&&next==eos)||is_stop(&m->c,next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
+        if(g_perf && m->n_emit%100==0) perf_report(m);
         if(emitted>=n_new) break;
         int g=0, gsrc=0;
         if(gd>0){
@@ -1230,6 +1598,47 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             }
         }
         if(!g&&gd>0){
+            if(m->has_mtp&&g_tree_draft){
+                int nodes[8], parent[8], tn=mtp_draft_tree(m,next,kv,nodes,parent);
+                if(tn>=4){
+                    build_tree_attn_mask(m,kv,tn,parent);
+                    float *lo=step_all(m,nodes,tn,kv+1); m->n_fw++;
+                    m->mtp_prop+=tn;
+                    int paths[4][2]={{0,2},{0,3},{1,4},{1,5}};
+                    int best_p=0,best_len=0;
+                    for(int p=0;p<4;p++){
+                        int r=paths[p][0],l=paths[p][1];
+                        int len=0;
+                        if(g_temp<=0){
+                            if(argmax_v(lo+(int64_t)r*V,V)==nodes[l]) len=2;
+                        } else {
+                            dist_build(lo+(int64_t)r*V,V);
+                            if(rndu()<g_pbuf[nodes[l]]) len=2;
+                        }
+                        if(len>best_len){ best_len=len; best_p=p; }
+                    }
+                    clear_tree_attn_mask(m);
+                    int r=paths[best_p][0], l=paths[best_p][1];
+                    int k=0;
+                    if(best_len>=1){
+                        if((eos>=0&&nodes[r]==eos)||is_stop(&m->c,nodes[r])) done=1;
+                        else { emit(nodes[r],ud); all[kv+1]=nodes[r]; emitted++; m->n_emit++; k=1; }
+                    }
+                    if(!done&&best_len>=2&&emitted<n_new){
+                        if((eos>=0&&nodes[l]==eos)||is_stop(&m->c,nodes[l])) done=1;
+                        else { emit(nodes[l],ud); all[kv+2]=nodes[l]; emitted++; m->n_emit++; k=2; }
+                    }
+                    if(m->has_mtp) m->mtp_acc+=k;
+                    if(m->has_mtp&&k>=1) mtp_absorb(m,all+kv+1,m->h_all,k,kv);
+                    kv+=k;
+                    logit=falloc(V);
+                    if(k>0&&k<tn) memcpy(logit,lo+(int64_t)(k-1)*V,V*sizeof(float));
+                    else if(k>=2) memcpy(logit,lo+(int64_t)l*V,V*sizeof(float));
+                    else memcpy(logit,lo,V*sizeof(float));
+                    free(lo);
+                    continue;
+                }
+            }
             if(m->has_mtp){ g=mtp_draft(m,next,kv,gd,draft); m->mtp_prop+=g; if(g)gsrc=2; }
             else { g=ngram_draft(all,kv+1,gd,draft); if(g)gsrc=2; }
         }
@@ -1323,6 +1732,10 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
 static double kv_pool_bytes(Model *m, int max_ctx){
     Cfg *c=&m->c;
     int nl=c->n_layers+(m->has_mtp?1:0);
+    if(g_kv_i8){
+        int64_t per=(int64_t)c->n_kv_heads*max_ctx;
+        return (double)nl*(2.0*(double)per*c->head_dim+2.0*(double)per*4.0);
+    }
     return (double)nl*max_ctx*c->n_kv_heads*c->head_dim*4.0*2.0;
 }
 
@@ -1539,6 +1952,14 @@ static void profile_print(Model *m, double elapsed){
         m->t_edisk,m->t_emm,m->t_attn,m->t_head,elapsed-acc);
 }
 
+static void perf_report(Model *m){
+    double total=m->t_attn+m->t_edisk+m->t_emm+m->t_head;
+    if(total<1e-9) return;
+    fprintf(stderr,"[perf] attn=%.1f%% disk=%.1f%% expert_mm=%.1f%% head=%.1f%%\n",
+        100.0*m->t_attn/total, 100.0*m->t_edisk/total,
+        100.0*m->t_emm/total, 100.0*m->t_head/total);
+}
+
 static char g_usage_path[2100]="";
 static void stats_dump_q(Model *m, const char *path, int quiet){
     char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
@@ -1609,9 +2030,12 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     profile_print(m,dt);
 }
 
-static int decode_tokens(Model *m, Tok *T, int *all, int kv, int n_new, int eos, float *logit){
+static int decode_tokens(Model *m, Tok *T, int *all, int kv, int n_new, int eos, float *logit,
+                         double *decode_sec){
     EmitStream es={T,m,now_s(),0};
-    return spec_decode(m,all,kv,n_new,eos,logit,emit_stream,&es,NULL);
+    int n=spec_decode(m,all,kv,n_new,eos,logit,emit_stream,&es,NULL);
+    if(decode_sec) *decode_sec=now_s()-es.t0;
+    return n;
 }
 
 static const char *hy3_effort(int think){
@@ -1653,7 +2077,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int *all=malloc((size_t)(np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,(size_t)np*sizeof(int));
     double t=now_s();
     float *logit=step(m,pids,np,0);
-    int produced=decode_tokens(m,&T,all,np,ngen,eos,logit);
+    int produced=decode_tokens(m,&T,all,np,ngen,eos,logit,NULL);
     double dt=now_s()-t, tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<m->c.n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\n%d tokens in %.2fs (%.2f tok/s) | expert hit %.1f%% | RSS %.2f GB\n",
@@ -1695,11 +2119,14 @@ static void run_serve(Model *m, const char *snap){
             if(len<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout); continue; }
             uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
             float *logit=step(m,hist+len-1,1,len-1);
-            int prod=decode_tokens(m,&T,hist,len,ngen,eos,logit); len+=prod;
+            double decode_t=0;
+            int prod=decode_tokens(m,&T,hist,len,ngen,eos,logit,&decode_t); len+=prod;
             double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
+            double decode_tps=prod>0&&decode_t>1e-6?prod/decode_t:0.0;
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
             printf("\n\x01\x01" "END" "\x01\x01\n");
-            printf("STAT %d %.2f %.1f %.2f\n",prod,prod/tdt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb());
+            printf("STAT %d %.2f %.1f %.2f 0 0 %.2f\n",prod,prod/tdt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,
+                rss_gb(),decode_tps);
             fflush(stdout); usage_save(m); repin_pass(m); continue;
         }
         if(nr<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout); continue; }
@@ -1753,15 +2180,16 @@ static void run_serve(Model *m, const char *snap){
         float *logit;
         if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
         else logit=step(m,hist+len-1,1,len-1);
-        int prod=0;
-        if(cur>0) prod=decode_tokens(m,&T,hist,len,cur,eos,logit);
+        int prod=0; double decode_t=0;
+        if(cur>0) prod=decode_tokens(m,&T,hist,len,cur,eos,logit,&decode_t);
         else free(logit);
         len+=prod;
         double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
+        double decode_tps=prod>0&&decode_t>1e-6?prod/decode_t:0.0;
         double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
         printf("%s\x01\x01" "END" "\x01\x01\n",raw_mode?"":"\n");
-        printf("STAT %d %.2f %.1f %.2f %d %d\n",prod,prod/tdt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,
-            rss_gb(),prompt_tokens,prod>=cur);
+        printf("STAT %d %.2f %.1f %.2f %d %d %.2f\n",prod,prod/tdt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,
+            rss_gb(),prompt_tokens,prod>=cur,decode_tps);
         fflush(stdout); usage_save(m); repin_pass(m);
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
     }
@@ -1788,8 +2216,18 @@ int main(int argc, char **argv){
     g_idot=getenv("IDOT")?atoi(getenv("IDOT")):0;  /* IDOT=1 breaks int4/int8 on Hy3 until validated */
     g_i4s=getenv("I4S")?atoi(getenv("I4S")):g_i4s;
     g_pipe=getenv("PIPE")?atoi(getenv("PIPE")):0;
+    if(g_pipe==2){
+#if !defined(__linux__) || !defined(COLI_IOURING)
+        fprintf(stderr,"[PIPE] io_uring requires Linux build with IOURING=1, using thread pool\n");
+        g_pipe=1;
+#endif
+    }
     g_pipe_nw=getenv("PIPE_WORKERS")?atoi(getenv("PIPE_WORKERS")):8;
     if(g_pipe_nw<1) g_pipe_nw=1;
+    g_perf=getenv("PERF")?atoi(getenv("PERF")):0;
+    g_kv_i8=getenv("KV_I8")?atoi(getenv("KV_I8")):0;
+    g_tree_draft=getenv("TREE_DRAFT")?atoi(getenv("TREE_DRAFT")):0;
+    if(g_tree_draft) fprintf(stderr,"[TREE_DRAFT] tree speculative decoding enabled\n");
     g_temp=getenv("TEMP")?atof(getenv("TEMP")):-1;
     g_nuc=getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;
     g_topk=getenv("TOPK")?atoi(getenv("TOPK")):0;
@@ -1812,6 +2250,7 @@ int main(int argc, char **argv){
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    g_cuda_attn=getenv("CUDA_ATTN")?atoi(getenv("CUDA_ATTN")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
@@ -1835,6 +2274,12 @@ int main(int argc, char **argv){
     printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d%s\n",
         now_s()-t0,m.resident_bytes/(1024.0*1024.0),m.c.n_layers,m.c.n_experts,
         m.has_mtp?" | MTP head active":"");
+    if(g_kv_i8){
+        int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;
+        double i8b=kv_pool_bytes(&m,est_ctx);
+        int save=g_kv_i8; g_kv_i8=0; double f32b=kv_pool_bytes(&m,est_ctx); g_kv_i8=save;
+        fprintf(stderr,"[KV] int8 cache: %.2f GB vs f32 %.2f GB at ctx=%d\n",i8b/1e9,f32b/1e9,est_ctx);
+    }
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"WARNING: model on %s (slow 9p mount). Use ext4 (e.g. /home/ or native /mnt/d/) for speed.\n",snap);
     if(getenv("PIN")) pin_load(&m,getenv("PIN"),getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);

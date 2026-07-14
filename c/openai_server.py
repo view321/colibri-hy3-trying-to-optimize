@@ -498,6 +498,7 @@ def read_engine_turn(stream, sentinel, on_bytes):
         "rss_gb": float(fields[4]),
         "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
         "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+        "decode_tokens_per_second": float(fields[7]) if len(fields) > 7 else None,
     }
 
 
@@ -538,6 +539,7 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+            "decode_tokens_per_second": float(fields[7]) if len(fields) > 7 else None,
         }
 
     def _fail_pending(self, error):
