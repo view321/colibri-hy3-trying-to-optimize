@@ -181,6 +181,8 @@ static int g_cuda_dense;
 static int g_cuda_attn;
 static int g_cuda_egroup;         /* CUDA_EGROUP: batch VRAM-resident experts through one grouped kernel */
 static int g_cuda_stream_experts; /* CUDA_STREAM_EXPERTS: JIT-stream RAM/disk experts to the GPU */
+static int g_cuda_stream_batch;   /* CUDA_STREAM_BATCH: max experts per streamed sub-batch (bounds VRAM scratch) */
+static int g_stream_off;          /* set after a streaming failure: fall back to CPU for the rest of the run */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -1275,25 +1277,36 @@ static void moe_gpu_block(Model *m,ESlot **use,int nb,const int *Eoff,const int 
             m->gpu_expert_calls+=cnt;
         }
     }
-    /* Pass 2: non-resident int4 experts streamed to the primary device. */
-    if(g_cuda_stream_experts){
+    /* Pass 2: non-resident int4 experts JIT-streamed to the primary device, in
+     * bounded sub-batches so the weight scratch fits alongside a resident tier.
+     * A single failure (e.g. VRAM full) disables streaming for the rest of the
+     * run and falls back to CPU rather than spamming the OOM line every token. */
+    if(g_cuda_stream_experts && !g_stream_off){
         const void *gw[64],*uw[64],*dw[64]; const float *gs[64],*us[64],*ds[64];
         int Rw[64],jj[64],cnt=0; int64_t xoff=0; int dev=g_cuda_devices[0];
-        for(int j=0;j<nb;j++){ if(handled[j]) continue; ESlot *e=use[j];
+        int cap=(g_cuda_stream_batch>0&&g_cuda_stream_batch<64)?g_cuda_stream_batch:64;
+        for(int j=0;j<=nb;j++){
+            if((j==nb||cnt==cap)&&cnt){
+                if(coli_cuda_expert_group_stream(gw,uw,dw,gs,us,ds,Rw,cnt,D,I,dev,ybatch,xbatch)){
+                    int64_t yo=0;
+                    for(int c=0;c<cnt;c++){ int jc=jj[c];
+                        for(int r=0;r<Rw[c];r++){ float *os=out+(int64_t)rows[Eoff[jc]+r]*D, wgt=rw[Eoff[jc]+r], *hr=ybatch+(yo+r)*(int64_t)D;
+                            for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                        handled[jc]=1; yo+=Rw[c]; }
+                    m->gpu_expert_calls+=cnt; cnt=0; xoff=0;
+                } else {
+                    fprintf(stderr,"[CUDA] expert streaming disabled after a failure; using CPU (lower --vram or set CUDA_STREAM_BATCH smaller)\n");
+                    g_stream_off=1; break;
+                }
+            }
+            if(j==nb) break;
+            if(handled[j]) continue; ESlot *e=use[j];
             if(!e->g.cuda_eligible && e->g.fmt==2 && e->u.fmt==2 && e->d.fmt==2){
                 for(int r=0;r<Enr[j];r++)
                     memcpy(xbatch+(xoff+r)*(int64_t)D,x+(int64_t)rows[Eoff[j]+r]*D,(size_t)D*sizeof(float));
                 gw[cnt]=e->g.q4; gs[cnt]=e->g.s; uw[cnt]=e->u.q4; us[cnt]=e->u.s; dw[cnt]=e->d.q4; ds[cnt]=e->d.s;
                 Rw[cnt]=Enr[j]; jj[cnt]=j; cnt++; xoff+=Enr[j];
             }
-        }
-        if(cnt && coli_cuda_expert_group_stream(gw,uw,dw,gs,us,ds,Rw,cnt,D,I,dev,ybatch,xbatch)){
-            int64_t yo=0;
-            for(int c=0;c<cnt;c++){ int j=jj[c];
-                for(int r=0;r<Rw[c];r++){ float *os=out+(int64_t)rows[Eoff[j]+r]*D, wgt=rw[Eoff[j]+r], *hr=ybatch+(yo+r)*(int64_t)D;
-                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-                handled[j]=1; yo+=Rw[c]; }
-            m->gpu_expert_calls+=cnt;
         }
     }
 }
@@ -2336,6 +2349,7 @@ int main(int argc, char **argv){
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
     g_cuda_egroup=getenv("CUDA_EGROUP")?atoi(getenv("CUDA_EGROUP")):0;
     g_cuda_stream_experts=getenv("CUDA_STREAM_EXPERTS")?atoi(getenv("CUDA_STREAM_EXPERTS")):0;
+    g_cuda_stream_batch=getenv("CUDA_STREAM_BATCH")?atoi(getenv("CUDA_STREAM_BATCH")):8;
     if((g_cuda_egroup||g_cuda_stream_experts)&&!g_cuda_enabled){ fprintf(stderr,"CUDA_EGROUP/CUDA_STREAM_EXPERTS require COLI_CUDA=1\n"); return 2; }
     if(g_cuda_enabled&&(g_cuda_egroup||g_cuda_stream_experts))
         fprintf(stderr,"[CUDA] expert batching: egroup=%d stream=%d\n",g_cuda_egroup,g_cuda_stream_experts);
