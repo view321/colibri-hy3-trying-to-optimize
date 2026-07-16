@@ -27,6 +27,9 @@ typedef struct {
     float *gq,*gk,*gv,*gctx,*gsc; size_t gq_cap,gk_cap,gv_cap,gctx_cap,gsc_cap;
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
+    /* JIT-streaming scratch: non-resident expert weights uploaded per call. */
+    void *sw_g,*sw_u,*sw_d; size_t sw_g_cap,sw_u_cap,sw_d_cap;
+    float *ss_g,*ss_u,*ss_d; size_t ss_g_cap,ss_u_cap,ss_d_cap;
     size_t tensor_count, tensor_bytes;
 } DeviceContext;
 
@@ -336,6 +339,10 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
+        if (ctx->sw_g) cudaFree(ctx->sw_g); if (ctx->sw_u) cudaFree(ctx->sw_u); if (ctx->sw_d) cudaFree(ctx->sw_d);
+        if (ctx->ss_g) cudaFree(ctx->ss_g); if (ctx->ss_u) cudaFree(ctx->ss_u); if (ctx->ss_d) cudaFree(ctx->ss_d);
+        ctx->sw_g=ctx->sw_u=ctx->sw_d=nullptr; ctx->ss_g=ctx->ss_u=ctx->ss_d=nullptr;
+        ctx->sw_g_cap=ctx->sw_u_cap=ctx->sw_d_cap=0; ctx->ss_g_cap=ctx->ss_u_cap=ctx->ss_d_cap=0;
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
@@ -550,6 +557,64 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
           g_group_h2d_ms+=a; g_group_kernel_ms+=b; g_group_d2h_ms+=c; }
         for(int i=0;i<4;i++) cudaEventDestroy(ev[i]);
     }
+    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+    return 1;
+}
+
+/* JIT-streaming grouped experts: same kernels as coli_cuda_expert_group, but the
+ * int4 weights are NOT resident. They are uploaded from host slabs into reusable
+ * device scratch each call (this is the PCIe-bound path — measure vs CPU). All
+ * experts must share shape (D,I) and be int4 (fmt==2). Host weights use the
+ * offset-8 nibble encoding; offset_to_signed_s4 converts them in place after upload,
+ * exactly as coli_cuda_tensor_upload does for resident tensors. */
+extern "C" int coli_cuda_expert_group_stream(
+        const void *const *gw,const void *const *uw,const void *const *dw,
+        const float *const *gs,const float *const *us,const float *const *ds,
+        const int *rows,int count,int D,int I,int device,
+        float *y,const float *x){
+    if(!gw||!uw||!dw||!gs||!us||!ds||!rows||!x||!y||count<1||count>64||D<1||I<1) return 0;
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    int total=0,max_rows=0;
+    for(int c=0;c<count;c++){ if(rows[c]<1) return 0; total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c]; }
+    size_t gstride=(size_t)I*((D+1)/2), dstride=(size_t)D*((I+1)/2);
+    size_t gsz=(size_t)count*gstride, dsz=(size_t)count*dstride;
+    size_t gssz=(size_t)count*I*sizeof(float), dssz=(size_t)count*D*sizeof(float);
+    size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
+    if(!reserve_bytes(&ctx->sw_g,&ctx->sw_g_cap,gsz)||!reserve_bytes(&ctx->sw_u,&ctx->sw_u_cap,gsz)||
+       !reserve_bytes(&ctx->sw_d,&ctx->sw_d_cap,dsz)||
+       !reserve(&ctx->ss_g,&ctx->ss_g_cap,gssz)||!reserve(&ctx->ss_u,&ctx->ss_u_cap,gssz)||
+       !reserve(&ctx->ss_d,&ctx->ss_d_cap,dssz)||
+       !reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
+       !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))) return 0;
+    GroupDesc host[64]; int off=0;
+    for(int c=0;c<count;c++){
+        uint8_t *gd=(uint8_t*)ctx->sw_g+(size_t)c*gstride;
+        uint8_t *ud=(uint8_t*)ctx->sw_u+(size_t)c*gstride;
+        uint8_t *dd=(uint8_t*)ctx->sw_d+(size_t)c*dstride;
+        float *gsd=ctx->ss_g+(size_t)c*I,*usd=ctx->ss_u+(size_t)c*I,*dsd=ctx->ss_d+(size_t)c*D;
+        if(!cuda_ok(cudaMemcpyAsync(gd,gw[c],gstride,cudaMemcpyHostToDevice,ctx->stream),"stream gate w")||
+           !cuda_ok(cudaMemcpyAsync(ud,uw[c],gstride,cudaMemcpyHostToDevice,ctx->stream),"stream up w")||
+           !cuda_ok(cudaMemcpyAsync(dd,dw[c],dstride,cudaMemcpyHostToDevice,ctx->stream),"stream down w")||
+           !cuda_ok(cudaMemcpyAsync(gsd,gs[c],(size_t)I*sizeof(float),cudaMemcpyHostToDevice,ctx->stream),"stream gate s")||
+           !cuda_ok(cudaMemcpyAsync(usd,us[c],(size_t)I*sizeof(float),cudaMemcpyHostToDevice,ctx->stream),"stream up s")||
+           !cuda_ok(cudaMemcpyAsync(dsd,ds[c],(size_t)D*sizeof(float),cudaMemcpyHostToDevice,ctx->stream),"stream down s")) return 0;
+        host[c]={gd,ud,dd,gsd,usd,dsd,2,2,2,rows[c],off}; off+=rows[c];
+    }
+    offset_to_signed_s4<<<(unsigned)((gsz+255)/256),256,0,ctx->stream>>>((uint8_t*)ctx->sw_g,gsz);
+    offset_to_signed_s4<<<(unsigned)((gsz+255)/256),256,0,ctx->stream>>>((uint8_t*)ctx->sw_u,gsz);
+    offset_to_signed_s4<<<(unsigned)((dsz+255)/256),256,0,ctx->stream>>>((uint8_t*)ctx->sw_d,dsz);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),cudaMemcpyHostToDevice,ctx->stream),"stream desc")||
+       !cuda_ok(cudaMemcpyAsync(ctx->x,x,xb,cudaMemcpyHostToDevice,ctx->stream),"stream x")) return 0;
+    GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+    dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+    grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+    silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+    grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    if(!cuda_ok(cudaGetLastError(),"stream expert launch")||
+       !cuda_ok(cudaMemcpyAsync(y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),"stream expert download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"stream expert synchronize")) return 0;
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
     return 1;

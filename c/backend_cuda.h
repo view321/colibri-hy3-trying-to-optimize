@@ -64,6 +64,15 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            const int *rows, int count,
                            float *y, const float *x);
 
+/* Same as coli_cuda_expert_group but for NON-resident int4 experts: weights are
+ * streamed from host slabs into device scratch each call (PCIe-bound). All experts
+ * share shape (D,I) and fmt int4. rows/x/y layout matches coli_cuda_expert_group. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_stream(
+                           const void *const *gw, const void *const *uw, const void *const *dw,
+                           const float *const *gs, const float *const *us, const float *const *ds,
+                           const int *rows, int count, int D, int I, int device,
+                           float *y, const float *x);
+
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,
                                const float *latent,const float *rope,int H,int Q,

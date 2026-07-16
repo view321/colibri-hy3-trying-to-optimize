@@ -179,6 +179,8 @@ static int g_cuda_enabled;
 static double g_cuda_expert_gb;
 static int g_cuda_dense;
 static int g_cuda_attn;
+static int g_cuda_egroup;         /* CUDA_EGROUP: batch VRAM-resident experts through one grouped kernel */
+static int g_cuda_stream_experts; /* CUDA_STREAM_EXPERTS: JIT-stream RAM/disk experts to the GPU */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -196,6 +198,15 @@ static void cuda_stats_print(void){
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
         fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
+    }
+    if(g_cuda_egroup||g_cuda_stream_experts){
+        uint64_t gc=0,ge=0,gr=0; double h2d=0,ker=0,d2h=0;
+        coli_cuda_group_stats(&gc,&ge,&gr,&h2d,&ker,&d2h);
+        if(gc){
+            fprintf(stderr,"[CUDA] grouped: %llu calls, %llu experts, %llu rows (avg %.1f experts/call)\n",
+                (unsigned long long)gc,(unsigned long long)ge,(unsigned long long)gr,gc?(double)ge/gc:0.0);
+            if(h2d+ker+d2h>0) fprintf(stderr,"[CUDA] grouped profile: h2d %.0fms · kernel %.0fms · d2h %.0fms (set COLI_CUDA_PROFILE=1)\n",h2d,ker,d2h);
+        }
     }
 }
 static int parse_cuda_devices(const char *list, int *out){
@@ -1234,6 +1245,60 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     free(g); free(u);
 }
 
+#ifdef COLI_CUDA
+/* Batch a block's experts onto the GPU. Sets handled[j]=1 for each expert whose
+ * gate/up/down MLP was computed on-device and scattered (weighted) into `out`;
+ * experts left 0 fall back to the CPU path in the caller. Two passes:
+ *   (1) CUDA_EGROUP: VRAM-resident experts via one grouped kernel per device.
+ *   (2) CUDA_STREAM_EXPERTS: non-resident int4 experts JIT-streamed over PCIe.
+ * xbatch/ybatch are caller scratch of at least (sum Enr)*D floats. */
+static void moe_gpu_block(Model *m,ESlot **use,int nb,const int *Eoff,const int *Enr,
+        const int *rows,const float *rw,const float *x,float *out,
+        float *xbatch,float *ybatch,int D,int I,char *handled){
+    /* Pass 1: VRAM-resident experts, grouped per device. */
+    if(g_cuda_egroup) for(int pd=0;pd<g_cuda_ndev;pd++){
+        int dev=g_cuda_devices[pd];
+        ColiCudaTensor *G[64],*U[64],*Dn[64]; int Rw[64],jj[64],cnt=0; int64_t xoff=0;
+        for(int j=0;j<nb;j++){ if(handled[j]) continue; ESlot *e=use[j];
+            if(e->g.cuda_eligible && e->g.cuda_device==dev){
+                for(int r=0;r<Enr[j];r++)
+                    memcpy(xbatch+(xoff+r)*(int64_t)D,x+(int64_t)rows[Eoff[j]+r]*D,(size_t)D*sizeof(float));
+                G[cnt]=e->g.cuda; U[cnt]=e->u.cuda; Dn[cnt]=e->d.cuda; Rw[cnt]=Enr[j]; jj[cnt]=j; cnt++; xoff+=Enr[j];
+            }
+        }
+        if(cnt && coli_cuda_expert_group(G,U,Dn,Rw,cnt,ybatch,xbatch)){
+            int64_t yo=0;
+            for(int c=0;c<cnt;c++){ int j=jj[c];
+                for(int r=0;r<Rw[c];r++){ float *os=out+(int64_t)rows[Eoff[j]+r]*D, wgt=rw[Eoff[j]+r], *hr=ybatch+(yo+r)*(int64_t)D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                handled[j]=1; yo+=Rw[c]; }
+            m->gpu_expert_calls+=cnt;
+        }
+    }
+    /* Pass 2: non-resident int4 experts streamed to the primary device. */
+    if(g_cuda_stream_experts){
+        const void *gw[64],*uw[64],*dw[64]; const float *gs[64],*us[64],*ds[64];
+        int Rw[64],jj[64],cnt=0; int64_t xoff=0; int dev=g_cuda_devices[0];
+        for(int j=0;j<nb;j++){ if(handled[j]) continue; ESlot *e=use[j];
+            if(!e->g.cuda_eligible && e->g.fmt==2 && e->u.fmt==2 && e->d.fmt==2){
+                for(int r=0;r<Enr[j];r++)
+                    memcpy(xbatch+(xoff+r)*(int64_t)D,x+(int64_t)rows[Eoff[j]+r]*D,(size_t)D*sizeof(float));
+                gw[cnt]=e->g.q4; gs[cnt]=e->g.s; uw[cnt]=e->u.q4; us[cnt]=e->u.s; dw[cnt]=e->d.q4; ds[cnt]=e->d.s;
+                Rw[cnt]=Enr[j]; jj[cnt]=j; cnt++; xoff+=Enr[j];
+            }
+        }
+        if(cnt && coli_cuda_expert_group_stream(gw,uw,dw,gs,us,ds,Rw,cnt,D,I,dev,ybatch,xbatch)){
+            int64_t yo=0;
+            for(int c=0;c<cnt;c++){ int j=jj[c];
+                for(int r=0;r<Rw[c];r++){ float *os=out+(int64_t)rows[Eoff[j]+r]*D, wgt=rw[Eoff[j]+r], *hr=ybatch+(yo+r)*(int64_t)D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                handled[j]=1; yo+=Rw[c]; }
+            m->gpu_expert_calls+=cnt;
+        }
+    }
+}
+#endif
+
 /* MoE: HYV3TopKRouter math (sigmoid, bias for selection, normalize, router_scaling_factor) */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
@@ -1274,7 +1339,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         int e=idxs[(int64_t)s*K+kk]; if(!seen[e]){ seen[e]=1; uniq[nu++]=e; }
     }
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
-    int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
+    int *rows=malloc((size_t)S*K*sizeof(int)); float *rw=malloc((size_t)S*K*sizeof(float));
+    float *xbatch=NULL,*ybatch=NULL;
+#ifdef COLI_CUDA
+    int usegpu = g_cuda_enabled && (g_cuda_egroup||g_cuda_stream_experts);
+    if(usegpu){ xbatch=falloc((int64_t)S*K*D); ybatch=falloc((int64_t)S*K*D); }
+#endif
     for(int base=0;base<nu;base+=64){
         int nb=nu-base<64?nu-base:64;
         ESlot *use[64]; int missk[64], qof[64], nmiss=0;
@@ -1303,24 +1373,35 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
-            if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk+=now_s()-tw; }
-            int nr=0;
+        /* Wait for every pending disk load in this block before any compute, so the
+         * GPU batch below sees all experts resident in RAM. */
+        for(int j=0;j<nb;j++) if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk+=now_s()-tw; }
+        /* Per-expert row lists, packed contiguously into rows[]/rw[] at Eoff[j]. */
+        int Eoff[64],Enr[64],tot=0;
+        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; int nr=0;
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
-                if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
-            if(!nr) continue;
+                if(idxs[(int64_t)s*K+kk]==eid){ rows[tot+nr]=s; rw[tot+nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+            Eoff[j]=tot; Enr[j]=nr; tot+=nr;
+        }
+        char handled[64]; memset(handled,0,(size_t)nb);
+        double t0=now_s();
+#ifdef COLI_CUDA
+        if(usegpu) moe_gpu_block(m,use,nb,Eoff,Enr,rows,rw,x,out,xbatch,ybatch,D,I,handled);
+#endif
+        /* CPU path for whatever the GPU did not take (default: everything). */
+        for(int j=0;j<nb;j++){ if(handled[j]) continue; ESlot *e=use[j]; int nr=Enr[j]; if(!nr) continue;
+            const int *er=rows+Eoff[j]; const float *ew=rw+Eoff[j];
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
 #endif
-            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)rows[r]*D,D*sizeof(float));
-            double t0=now_s();
+            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)er[r]*D,(size_t)D*sizeof(float));
             matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             matmul_qt(hh,gg,&e->d,nr);
-            for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
+            for(int r=0;r<nr;r++){ float *os=out+(int64_t)er[r]*D, wgt=ew[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-            m->t_emm+=now_s()-t0;
         }
+        m->t_emm+=now_s()-t0;
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
           int promo=nmiss<m->ecap?nmiss:m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -1336,6 +1417,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
     free(logit); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
+    if(xbatch) free(xbatch); if(ybatch) free(ybatch);
 }
 
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
@@ -2252,6 +2334,11 @@ int main(int argc, char **argv){
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_attn=getenv("CUDA_ATTN")?atoi(getenv("CUDA_ATTN")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
+    g_cuda_egroup=getenv("CUDA_EGROUP")?atoi(getenv("CUDA_EGROUP")):0;
+    g_cuda_stream_experts=getenv("CUDA_STREAM_EXPERTS")?atoi(getenv("CUDA_STREAM_EXPERTS")):0;
+    if((g_cuda_egroup||g_cuda_stream_experts)&&!g_cuda_enabled){ fprintf(stderr,"CUDA_EGROUP/CUDA_STREAM_EXPERTS require COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_enabled&&(g_cuda_egroup||g_cuda_stream_experts))
+        fprintf(stderr,"[CUDA] expert batching: egroup=%d stream=%d\n",g_cuda_egroup,g_cuda_stream_experts);
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_expert_gb>0 && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
