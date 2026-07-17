@@ -129,7 +129,11 @@ __global__ static void quantize_s4_rows(uint8_t *q,float *scale,const float *x,i
 
 __global__ static void grouped_s4_wmma(float *y,const uint8_t *x,const float *xscale,
                                         const GroupDesc *desc,int K,int O,int which){
-#if __CUDA_ARCH__ >= 750
+/* Sub-byte (s4) WMMA exists only on sm_75..sm_89 (Turing/Ampere/Ada). Hopper (sm_90)
+ * deprecated it and Blackwell (sm_120) + CUDA 12.8 removed the type entirely, so
+ * referencing it there fails to compile. Compile the body only where it's valid;
+ * this path is opt-in (COLI_CUDA_TC_INT4) and unused on Blackwell regardless. */
+#if __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900
     using namespace nvcuda;
     int warp=threadIdx.x/32,lane=threadIdx.x%32,tile=blockIdx.x*8+warp,c=blockIdx.y;
     if(tile*8>=O)return; GroupDesc d=desc[c];
