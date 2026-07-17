@@ -200,6 +200,38 @@ static int qt_cuda_upload(QT *t){
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
+static const void *qt_wptr(const QT *t){
+    return t->fmt==0 ? (const void*)t->qf : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+}
+/* Upload one expert's g/u/d as a single device slab (see coli_cuda_expert_upload:
+ * six per-tensor cudaMallocs waste ~25% of VRAM to allocation granularity, which
+ * is how byte-accounted fills used to physically OOM the card). The slot's three
+ * QTs must share cuda_device and hold host copies. */
+static int eslot_cuda_upload(ESlot *s){
+    return coli_cuda_expert_upload(&s->g.cuda,&s->u.cuda,&s->d.cuda,
+        qt_wptr(&s->g),s->g.s,s->g.fmt,s->g.I,s->g.O,
+        qt_wptr(&s->u),s->u.s,s->u.fmt,s->u.I,s->u.O,
+        qt_wptr(&s->d),s->d.s,s->d.fmt,s->d.I,s->d.O,
+        s->g.cuda_device);
+}
+static int cuda_slot_of(int device){
+    for(int i=0;i<g_cuda_ndev;i++) if(g_cuda_devices[i]==device) return i;
+    return -1;
+}
+static double cuda_vram_reserve(void){
+    return (getenv("CUDA_VRAM_RESERVE_GB")?atof(getenv("CUDA_VRAM_RESERVE_GB")):3.0)*1e9;
+}
+/* Physical headroom left for MORE experts on device slot i: live free VRAM minus
+ * what decode still needs — dense tensors not yet resident plus the scratch/KV
+ * reserve. Fills MUST consult this per upload instead of budgeting once from a
+ * startup probe: cudaMalloc granularity makes logical byte accounting undercount
+ * real usage, so a byte-budgeted fill can physically exhaust the card, and then
+ * every decode-time allocation (dense upload, egroup/attention scratch) OOMs. */
+static double cuda_expert_headroom(int slot){
+    size_t fb=0,tb=0;
+    if(slot<0||!coli_cuda_mem_info(g_cuda_devices[slot],&fb,&tb)) return 0;
+    return (double)fb-(double)g_cuda_dense_projected[slot]-cuda_vram_reserve();
+}
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
@@ -815,9 +847,15 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
          * dereferencing a NULL weight pointer. Only mark cuda_failed (permanent CPU
          * fallback) when a host copy actually exists. */
         if(!w->qf && !w->q8 && !w->q4){
+            static long zeroed;   /* CUDA path runs outside OMP parallel regions (guard above) */
+            long z=++zeroed;
             memset(y,0,(size_t)S*w->O*sizeof(float));
-            fprintf(stderr,"[CUDA] resident tensor [%d,%d] on device %d failed and has no RAM copy; output zeroed for this call\n",
-                w->O,w->I,w->cuda_device);
+            if(z==1) fprintf(stderr,
+                "[CUDA] WARNING: a VRAM-resident tensor call failed and has no RAM fallback; its output is ZEROED and generation quality is degraded.\n"
+                "[CUDA] WARNING: VRAM is over-committed at decode — lower --vram or raise CUDA_VRAM_RESERVE_GB.\n");
+            if(z<=3||(z&255)==0) fprintf(stderr,
+                "[CUDA] resident tensor [%d,%d] on device %d failed and has no RAM copy; output zeroed (%ld calls so far)\n",
+                w->O,w->I,w->cuda_device,z);
             return;
         }
         w->cuda_failed=1;
@@ -1356,6 +1394,19 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         m->lm_head=qt_load(m,"lm_head.weight",c->vocab,D,io_bits);
     else
         m->lm_head=m->embed; /* tie_word_embeddings */
+#ifdef COLI_CUDA
+    /* embed is read by row gather (embed_row), never matmul'd, so it must not
+     * consume a CUDA_DENSE VRAM slot. The lm_head copy above keeps its own
+     * eligibility (tied weights DO upload — as lm_head). Untied, embed's
+     * projected bytes would never actually upload: un-project them. */
+    if(m->embed.cuda_eligible){
+        if(qt_wptr(&m->lm_head)!=qt_wptr(&m->embed)){
+            int slot=cuda_slot_of(m->embed.cuda_device);
+            if(slot>=0) g_cuda_dense_projected[slot]-=qt_bytes(&m->embed);
+        }
+        m->embed.cuda_eligible=0;
+    }
+#endif
     m->final_norm=ld(m,"model.norm.weight");
     m->L=calloc(c->n_layers,sizeof(Layer));
     int nrows=c->n_layers+1;
@@ -2376,12 +2427,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
         int placed_n[COLI_CUDA_MAX_DEVICES]={0};
         double budget=g_cuda_expert_gb*1e9, safe_total=0;
         for(int i=0;i<g_cuda_ndev;i++){
-            size_t free_b=0,total_b=0;
-            if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-                remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
-                if(remaining[i]<0) remaining[i]=0;
-                safe_total+=remaining[i];
-            }
+            remaining[i]=cuda_expert_headroom(i);
+            if(remaining[i]<0) remaining[i]=0;
+            safe_total+=remaining[i];
         }
         if(budget>safe_total) budget=safe_total;
         for(int a=0;a<npin && m->gpu_expert_bytes<budget;a++){
@@ -2397,9 +2445,12 @@ static void pin_load(Model *m, const char *statspath, double gb){
                         (best<0||placed_b[i]<placed_b[best])) best=i;
                     if(best<0) break;
                     tried[best]=1;
+                    /* Live physical check: remaining[] is byte accounting and can be
+                     * optimistic vs allocation granularity; keep the reserve free. */
+                    if(cuda_expert_headroom(best)<(double)need+32e6){ remaining[best]=0; continue; }
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
                     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                    if(eslot_cuda_upload(s)){
                         int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                       +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
@@ -2424,6 +2475,42 @@ static void pin_load(Model *m, const char *statspath, double gb){
     pin_wire(m);
     free(r); free(cnt_l);
 }
+
+#ifdef COLI_CUDA
+/* CUDA_DENSE: upload every eligible dense tensor NOW, before any expert tier is
+ * filled. These used to upload lazily at the first forward pass, racing the
+ * expert fill for leftover VRAM: whatever the fill left was often not enough,
+ * the upload OOMed and the tensor was permanently demoted to CPU for the run.
+ * Dense tensors run every token; experts are hit probabilistically — dense gets
+ * VRAM first. Each landed upload comes off g_cuda_dense_projected, so the
+ * expert fills' headroom probe reserves only what is still pending. */
+static void cuda_dense_push(QT *t, int64_t *ub, int *un, int *fail){
+    if(*fail || !t->cuda_eligible || t->cuda || t->cuda_failed) return;
+    if(!t->qf && !t->q8 && !t->q4) return;   /* tensor absent on this layer */
+    if(qt_cuda_upload(t)){
+        int slot=cuda_slot_of(t->cuda_device);
+        if(slot>=0) g_cuda_dense_projected[slot]-=qt_bytes(t);
+        *ub+=qt_bytes(t); (*un)++;
+    } else *fail=1;   /* no room: stop here, the rest stay lazy/CPU */
+}
+static void cuda_dense_layer_push(Layer *L, int64_t *ub, int *un, int *fail){
+    cuda_dense_push(&L->q,ub,un,fail);         cuda_dense_push(&L->k,ub,un,fail);
+    cuda_dense_push(&L->v,ub,un,fail);         cuda_dense_push(&L->o,ub,un,fail);
+    cuda_dense_push(&L->gate_proj,ub,un,fail); cuda_dense_push(&L->up_proj,ub,un,fail);
+    cuda_dense_push(&L->down_proj,ub,un,fail); cuda_dense_push(&L->sh_gate,ub,un,fail);
+    cuda_dense_push(&L->sh_up,ub,un,fail);     cuda_dense_push(&L->sh_down,ub,un,fail);
+}
+static void cuda_dense_upload_all(Model *m){
+    if(!g_cuda_enabled||!g_cuda_dense) return;
+    int64_t ub=0; int un=0, fail=0; double t0=now_s();
+    cuda_dense_push(&m->lm_head,&ub,&un,&fail);
+    for(int l=0;l<m->c.n_layers;l++) cuda_dense_layer_push(&m->L[l],&ub,&un,&fail);
+    if(m->has_mtp){ cuda_dense_layer_push(&m->mtpL,&ub,&un,&fail);
+        cuda_dense_push(&m->eh_proj,&ub,&un,&fail); }
+    if(un||fail) fprintf(stderr,"[CUDA] dense tier: %d tensors resident (%.2f GB) in %.1fs%s\n",
+        un,ub/1e9,now_s()-t0,fail?" — VRAM full; the rest stay CPU/lazy":"");
+}
+#endif
 
 /* PRELOAD=1: make (almost) the whole expert set resident at startup instead of
  * streaming it on demand. Fills the VRAM tier first with the hottest experts and
@@ -2461,15 +2548,12 @@ static void preload_all(Model *m, double ram_gb, int max_ctx){
     int max_vram=0;
     if(g_cuda_enabled && g_cuda_expert_gb>0){ max_vram=(int)(g_cuda_expert_gb*1e9/eb); if(max_vram>n) max_vram=n; }
     if(max_vram>0){
-        double vbudget=g_cuda_expert_gb*1e9; size_t fb=0,tb=0;
-        if(coli_cuda_mem_info(g_cuda_devices[0],&fb,&tb)){
-            /* Leave room for lazily-uploaded dense tensors (CUDA_DENSE) and the runtime
-             * egroup/attention scratch — otherwise those OOM and fall back to CPU. */
-            double reserve=(getenv("CUDA_VRAM_RESERVE_GB")?atof(getenv("CUDA_VRAM_RESERVE_GB")):3.0)*1e9;
-            double safe=(double)fb-(double)g_cuda_dense_projected[0]-reserve; if(safe<0)safe=0;
-            if(vbudget>safe)vbudget=safe;
-        }
-        int stop=0, CH=256;
+        /* --vram is the LOGICAL cap on expert bytes; the PHYSICAL stop is the live
+         * cuda_expert_headroom probe before every upload, which keeps the reserve
+         * for dense tensors and egroup/attention scratch actually free on the
+         * device (allocation granularity makes logical accounting undercount). */
+        double vbudget=g_cuda_expert_gb*1e9;
+        int stop=0, oom=0, CH=256;
         for(int base=0; base<max_vram && !stop; base+=CH){
             int cnt=max_vram-base<CH?max_vram-base:CH;
             #pragma omp parallel for schedule(dynamic,1)
@@ -2480,10 +2564,11 @@ static void preload_all(Model *m, double ram_gb, int max_ctx){
             for(int a=base;a<base+cnt;a++){
                 ESlot *s=&m->pin[r[a].l][r[a].h];
                 int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-                if(!stop && (double)(vram_bytes+need)<=vbudget){
+                if(!stop && (double)(vram_bytes+need)<=vbudget
+                         && cuda_expert_headroom(0)>=(double)need+32e6){
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[0];
                     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                    if(qt_cuda_upload(&s->g)&&qt_cuda_upload(&s->u)&&qt_cuda_upload(&s->d)){
+                    if(eslot_cuda_upload(s)){
                         vram_bytes+=need; vram_n++; m->gpu_expert_count++; m->gpu_expert_bytes+=need;
                         compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;
                         free(s->fslab); s->fslab=NULL; s->fslab_cap=0;
@@ -2492,11 +2577,28 @@ static void preload_all(Model *m, double ram_gb, int max_ctx){
                     }
                     qt_cuda_reset(&s->g);qt_cuda_reset(&s->u);qt_cuda_reset(&s->d);
                     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
-                    stop=1;
+                    stop=1; oom=1;
                 } else stop=1;
-                ram_bytes+=eb; ram_n++;   /* budget hit or upload failed: keep this one in RAM */
+                ram_bytes+=eb; ram_n++;   /* budget/headroom hit or upload failed: keep this one in RAM */
             }
             va=base+cnt;
+        }
+        /* An upload failure means the device is physically exhausted and the
+         * reserve is gone: decode would OOM on every dense/scratch allocation and
+         * zero the output of resident experts. Give the coldest uploaded experts
+         * back to RAM until the reserve is actually free again. */
+        if(oom){
+            int nb=0;
+            for(int a=va-1; a>=0 && cuda_expert_headroom(0)<0; a--){
+                ESlot *s=&m->pin[r[a].l][r[a].h];
+                if(!s->g.cuda) continue;
+                qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                expert_load(m,r[a].l,r[a].e,s);   /* restore the host copy from disk */
+                vram_bytes-=eb; vram_n--; m->gpu_expert_count--; m->gpu_expert_bytes-=eb;
+                ram_bytes+=eb; ram_n++; nb++;
+            }
+            if(nb) fprintf(stderr,"[PRELOAD] VRAM overshoot: returned %d experts to RAM to restore the dense/scratch reserve\n",nb);
         }
     }
 #endif
@@ -2541,11 +2643,9 @@ static void cuda_vram_prefill(Model *m){
     if(m->has_mtp) nsp++;
     if(nsp<1) return;
     double remaining[COLI_CUDA_MAX_DEVICES]={0}, room_total=0;
-    double reserve=(getenv("CUDA_VRAM_RESERVE_GB")?atof(getenv("CUDA_VRAM_RESERVE_GB")):2.0)*1e9;
-    for(int i=0;i<g_cuda_ndev;i++){ size_t fb=0,tb=0;
-        if(coli_cuda_mem_info(g_cuda_devices[i],&fb,&tb)){
-            remaining[i]=(double)fb-(double)g_cuda_dense_projected[i]-reserve;
-            if(remaining[i]<0) remaining[i]=0; room_total+=remaining[i]; } }
+    for(int i=0;i<g_cuda_ndev;i++){
+        remaining[i]=cuda_expert_headroom(i);
+        if(remaining[i]<0) remaining[i]=0; room_total+=remaining[i]; }
     double budget=g_cuda_expert_gb*1e9; if(budget>room_total) budget=room_total;
     if(budget<(double)eb) return;
     int per_layer=(int)(budget/(double)nsp/(double)eb); if(per_layer<1) per_layer=1;
@@ -2578,9 +2678,12 @@ static void cuda_vram_prefill(Model *m){
             int dev=-1; for(int i=0;i<g_cuda_ndev;i++)
                 if(remaining[i]>=(double)eb&&(dev<0||remaining[i]>remaining[dev])) dev=i;
             if(dev<0){ stop=1; continue; }   /* VRAM full: remaining experts stay RAM-pinned */
+            /* Live physical check: allocation granularity makes remaining[] (byte
+             * accounting) optimistic, and the reserve must stay actually free. */
+            if(cuda_expert_headroom(dev)<(double)eb+32e6){ remaining[dev]=0; a--; continue; }
             s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[dev];
             s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-            if(qt_cuda_upload(&s->g)&&qt_cuda_upload(&s->u)&&qt_cuda_upload(&s->d)){
+            if(eslot_cuda_upload(s)){
                 int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                               +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                               +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
@@ -2640,7 +2743,11 @@ static void repin_pass(Model *m){
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){
-            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+            /* The old slab was freed by expert_load's cuda reset; require the
+             * upload to fit without eating the dense/scratch reserve. */
+            int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+            if(cuda_expert_headroom(cuda_slot_of(s->g.cuda_device))>=(double)need
+               && eslot_cuda_upload(s)){
                 int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
@@ -3084,6 +3191,9 @@ int main(int argc, char **argv){
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"WARNING: model on %s (slow 9p mount). Use ext4 (e.g. /home/ or native /mnt/d/) for speed.\n",snap);
     int pinned_any=0;
+#ifdef COLI_CUDA
+    cuda_dense_upload_all(&m);   /* dense first: every-token tensors outrank the expert tiers below */
+#endif
     if(getenv("PIN")&&!getenv("PRELOAD")){ pin_load(&m,getenv("PIN"),getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0); pinned_any=1; }
     { double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;

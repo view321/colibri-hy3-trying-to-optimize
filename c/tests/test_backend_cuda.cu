@@ -120,6 +120,27 @@ int main(int argc, char **argv) {
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
     if(group_calls!=3||group_experts!=6||group_total_rows!=6) return 1;
 
+    /* Slab upload: one allocation for a g/u/d triple must (a) be idempotent and
+       reject shape mismatches like coli_cuda_tensor_upload, (b) report the whole
+       slab on the owner and 0 on the borrowers so triple sums stay correct,
+       (c) produce the same grouped result as three per-tensor uploads, and
+       (d) free cleanly in any order (borrower first must not break the owner). */
+    ColiCudaTensor *sg=nullptr,*su=nullptr,*sd=nullptr;
+    if(!coli_cuda_expert_upload(&sg,&su,&sd,
+        w4,ws4,2,32,32, w4,ws4,2,32,32, w4,ws4,2,32,32, d0)) return 1;
+    if(!coli_cuda_expert_upload(&sg,&su,&sd,
+        w4,ws4,2,32,32, w4,ws4,2,32,32, w4,ws4,2,32,32, d0)) return 1;
+    if(coli_cuda_expert_upload(&sg,&su,&sd,
+        w4,ws4,2,32,16, w4,ws4,2,32,32, w4,ws4,2,32,32, d0)) return 1;
+    if(!coli_cuda_tensor_bytes(sg)||coli_cuda_tensor_bytes(su)||coli_cuda_tensor_bytes(sd)) return 1;
+    ColiCudaTensor *sgg[2]={sg,sg},*sug[2]={su,su},*sdg[2]={sd,sd};
+    float slab4[64];
+    if(!coli_cuda_expert_group(sgg,sug,sdg,group_rows,2,slab4,gx4)) return 1;
+    for(int i=0;i<64;i++) if(std::fabs(slab4[i]-scalar4[i])>1e-4f) return 1;
+    coli_cuda_tensor_free(su);
+    coli_cuda_tensor_free(sg);
+    coli_cuda_tensor_free(sd);
+
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {
         std::fprintf(stderr, "unexpected CUDA stats: %zu tensors, %zu bytes\n", count, bytes);

@@ -39,6 +39,20 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
 
+/* Upload one expert's gate/up/down tensors as a single device allocation.
+ * Six separate cudaMallocs per expert waste ~2 MB-granule padding on each
+ * multi-MB weight tensor (~25% of VRAM at typical int4 expert sizes); the slab
+ * wastes at most one granule. gate owns the allocation, up/down borrow into it
+ * (coli_cuda_tensor_bytes reports the whole slab on gate and 0 on the others,
+ * so summing a triple stays correct). Free all three via coli_cuda_tensor_free
+ * as usual, in any order. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_upload(
+                            ColiCudaTensor **gt, ColiCudaTensor **ut, ColiCudaTensor **dt,
+                            const void *gw, const float *gs, int gf, int gI, int gO,
+                            const void *uw, const float *us, int uf, int uI, int uO,
+                            const void *dw, const float *ds, int df, int dI, int dO,
+                            int device);
+
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
  * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2.

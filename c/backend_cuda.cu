@@ -15,6 +15,13 @@ struct ColiCudaTensor {
     size_t weight_bytes;
     int fmt, I, O, device;
     int tracked;
+    /* Slab-upload members (coli_cuda_expert_upload): the three tensors of one
+     * expert share a single cudaMalloc. `slab` is set on the owning tensor only
+     * (its weights are section 0, but the whole allocation is freed via slab);
+     * `borrowed` tensors point into the owner's slab and free nothing on the
+     * device. Per-tensor uploads leave both fields zero. */
+    void *slab; size_t slab_bytes;
+    int borrowed;
 };
 
 typedef struct {
@@ -553,6 +560,79 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* Upload one expert's gate/up/down weights (+ scales) as a SINGLE device
+ * allocation. cudaMalloc hands out driver granules (~2 MB): six allocations per
+ * expert (3 weights of a few MB + 3 tiny scale arrays) can burn ~25% more
+ * physical VRAM than the logical bytes, which is why byte accounting used to
+ * overshoot the card. One slab wastes at most one granule per expert. The gate
+ * tensor owns the slab; up/down borrow sections and free nothing on the device.
+ * Idempotent like coli_cuda_tensor_upload: if handles already exist, succeed
+ * only when every shape matches. */
+extern "C" int coli_cuda_expert_upload(
+        ColiCudaTensor **gt, ColiCudaTensor **ut, ColiCudaTensor **dt,
+        const void *gw, const float *gs, int gf, int gI, int gO,
+        const void *uw, const float *us, int uf, int uI, int uO,
+        const void *dw, const float *ds, int df, int dI, int dO,
+        int device) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!gt || !ut || !dt || !gw || !uw || !dw || !select_ctx(ctx)) return 0;
+    if (*gt || *ut || *dt) {
+        return *gt && *ut && *dt &&
+            (*gt)->fmt == gf && (*gt)->I == gI && (*gt)->O == gO && (*gt)->device == device &&
+            (*ut)->fmt == uf && (*ut)->I == uI && (*ut)->O == uO && (*ut)->device == device &&
+            (*dt)->fmt == df && (*dt)->I == dI && (*dt)->O == dO && (*dt)->device == device;
+    }
+    const void *w[3] = {gw, uw, dw};
+    const float *s[3] = {gs, us, ds};
+    int fm[3] = {gf, uf, df}, Is[3] = {gI, uI, dI}, Os[3] = {gO, uO, dO};
+    size_t wb[3], sb[3], off[6], cur = 0;
+    const size_t A = 256;   /* section alignment: covers float scales and coalesced loads */
+    for (int k = 0; k < 3; k++) {
+        size_t rb = row_bytes(fm[k], Is[k]);
+        if (!rb || Is[k] < 1 || Os[k] < 1 || (fm[k] && !s[k])) return 0;
+        wb[k] = rb * (size_t)Os[k];
+        sb[k] = fm[k] ? (size_t)Os[k] * sizeof(float) : 0;
+    }
+    for (int k = 0; k < 3; k++) { off[k] = cur; cur += (wb[k] + A - 1) & ~(A - 1); }
+    for (int k = 0; k < 3; k++) { off[3 + k] = cur; cur += (sb[k] + A - 1) & ~(A - 1); }
+    uint8_t *base = nullptr;
+    if (!cuda_ok(cudaMalloc(&base, cur), "expert slab allocation")) return 0;
+    for (int k = 0; k < 3; k++) {
+        if (!cuda_ok(cudaMemcpy(base + off[k], w[k], wb[k], cudaMemcpyHostToDevice), "expert slab upload") ||
+            (sb[k] && !cuda_ok(cudaMemcpy(base + off[3 + k], s[k], sb[k], cudaMemcpyHostToDevice), "expert slab scale upload"))) {
+            cudaFree(base);
+            return 0;
+        }
+    }
+    int converted = 0;
+    for (int k = 0; k < 3; k++) if (fm[k] == 2) {
+        offset_to_signed_s4<<<(unsigned)((wb[k] + 255) / 256), 256>>>(base + off[k], wb[k]);
+        if (!cuda_ok(cudaGetLastError(), "int4 weight conversion")) { cudaFree(base); return 0; }
+        converted = 1;
+    }
+    /* The conversion ran on the legacy stream; compute runs on the per-device
+     * non-blocking stream, so make the weights visible before returning. */
+    if (converted && !cuda_ok(cudaDeviceSynchronize(), "expert slab conversion sync")) { cudaFree(base); return 0; }
+    ColiCudaTensor *t[3];
+    for (int k = 0; k < 3; k++) {
+        t[k] = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t[k])));
+        if (!t[k]) { for (int z = 0; z < k; z++) std::free(t[z]); cudaFree(base); return 0; }
+    }
+    for (int k = 0; k < 3; k++) {
+        t[k]->fmt = fm[k]; t[k]->I = Is[k]; t[k]->O = Os[k]; t[k]->device = device;
+        t[k]->weights = base + off[k];
+        t[k]->scales = sb[k] ? reinterpret_cast<float *>(base + off[3 + k]) : nullptr;
+        t[k]->weight_bytes = wb[k];
+        t[k]->tracked = 1;
+        t[k]->borrowed = (k != 0);
+    }
+    t[0]->slab = base; t[0]->slab_bytes = cur;
+    ctx->tensor_count += 3;
+    ctx->tensor_bytes += cur;
+    *gt = t[0]; *ut = t[1]; *dt = t[2];
+    return 1;
+}
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
@@ -926,17 +1006,25 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     DeviceContext *ctx = find_ctx(tensor->device);
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
-        size_t bytes = tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * sizeof(float) : 0);
+        size_t bytes = coli_cuda_tensor_bytes(tensor);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
-    if (tensor->weights) cudaFree(tensor->weights);
-    if (tensor->scales) cudaFree(tensor->scales);
+    if (tensor->slab) cudaFree(tensor->slab);        /* owner: one free covers all sections */
+    else if (!tensor->borrowed) {
+        if (tensor->weights) cudaFree(tensor->weights);
+        if (tensor->scales) cudaFree(tensor->scales);
+    }
     std::free(tensor);
 }
 
+/* Slab owners report the whole allocation; borrowers report 0 so summing a
+ * g/u/d triple never double-counts. */
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
-    return tensor ? tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * sizeof(float) : 0) : 0;
+    if (!tensor) return 0;
+    if (tensor->slab) return tensor->slab_bytes;
+    if (tensor->borrowed) return 0;
+    return tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * sizeof(float) : 0);
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {

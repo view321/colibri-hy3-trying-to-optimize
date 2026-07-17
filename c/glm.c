@@ -193,6 +193,17 @@ static int qt_cuda_upload(QT *t){
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
+/* Physical headroom left for MORE experts on device slot i: live free VRAM minus
+ * pending dense tensors and the scratch reserve. Fills must consult this per
+ * upload: cudaMalloc granularity makes logical byte accounting undercount real
+ * usage, so a byte-budgeted fill can physically exhaust the card and starve the
+ * decode-time dense/scratch allocations. */
+static double cuda_expert_headroom(int slot){
+    size_t fb=0,tb=0;
+    if(slot<0||!coli_cuda_mem_info(g_cuda_devices[slot],&fb,&tb)) return 0;
+    double reserve=(getenv("CUDA_VRAM_RESERVE_GB")?atof(getenv("CUDA_VRAM_RESERVE_GB")):2.0)*1e9;
+    return (double)fb-(double)g_cuda_dense_projected[slot]-reserve;
+}
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
@@ -3474,11 +3485,8 @@ static void pin_load(Model *m, const char *statspath, double gb){
     int placed_n[COLI_CUDA_MAX_DEVICES]={0}, gpu_prefix=0;
     double budget=g_cuda_expert_gb*1e9, safe_total=0;
     if(g_cuda_enabled&&g_cuda_expert_gb>0) for(int i=0;i<g_cuda_ndev;i++){
-        size_t free_b=0,total_b=0;
-        if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
-            if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
-        }
+        remaining[i]=cuda_expert_headroom(i);
+        if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
     }
     if(budget>safe_total) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){ gpu_prefix=(int)(budget/eb)+g_cuda_ndev; if(gpu_prefix>npin)gpu_prefix=npin; }
@@ -3506,6 +3514,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
                         (best<0||placed_b[i]<placed_b[best])) best=i;
                     if(best<0) break;
                     tried[best]=1;
+                    /* Live physical check: remaining[] is byte accounting and can be
+                     * optimistic vs allocation granularity; keep the reserve free. */
+                    if(cuda_expert_headroom(best)<(double)need+32e6){ remaining[best]=0; continue; }
                     s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
                     s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
                     if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){

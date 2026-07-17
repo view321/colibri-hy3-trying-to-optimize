@@ -61,6 +61,11 @@ typedef int            (*fn_gqa_attention_cached)(int layer, float *ctx, const f
                                           int st0, int pos_base, int max_t, int device);
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
+typedef int            (*fn_expert_upload)(ColiCudaTensor **gt, ColiCudaTensor **ut, ColiCudaTensor **dt,
+                                           const void *gw, const float *gs, int gf, int gI, int gO,
+                                           const void *uw, const float *us, int uf, int uI, int uO,
+                                           const void *dw, const float *ds, int df, int dI, int dO,
+                                           int device);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device);
@@ -89,6 +94,7 @@ static struct {
     fn_gqa_attention   gqa_attention;
     fn_gqa_attention_cached gqa_attention_cached;
     fn_tensor_upload   tensor_upload;
+    fn_expert_upload   expert_upload;
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -141,6 +147,7 @@ static int coli_cuda_load(void){
     RESOLVE(gqa_attention,  fn_gqa_attention)
     RESOLVE(gqa_attention_cached, fn_gqa_attention_cached)
     RESOLVE(tensor_upload,  fn_tensor_upload)
+    RESOLVE(expert_upload,  fn_expert_upload)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -254,6 +261,16 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
                             const float *scales, int fmt, int I, int O, int device){
     if(!g_cuda.available) return 0;
     return g_cuda.tensor_upload(tensor, weights, scales, fmt, I, O, device);
+}
+
+int coli_cuda_expert_upload(ColiCudaTensor **gt, ColiCudaTensor **ut, ColiCudaTensor **dt,
+                            const void *gw, const float *gs, int gf, int gI, int gO,
+                            const void *uw, const float *us, int uf, int uI, int uO,
+                            const void *dw, const float *ds, int df, int dI, int dO,
+                            int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.expert_upload(gt, ut, dt, gw, gs, gf, gI, gO,
+                                uw, us, uf, uI, uO, dw, ds, df, dI, dO, device);
 }
 
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
