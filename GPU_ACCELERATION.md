@@ -28,6 +28,29 @@ prefill places the *hottest* experts in VRAM, so GPU coverage of actual routes c
 Everything is still optional — build without `CUDA=1` and you get the exact original CPU
 engine; build with CUDA but run without `--gpu` and it stays on the CPU path.
 
+### Decode-path optimizations (this pass)
+
+On top of *making the GPU do the expert work*, these reduce how long that work takes and how
+much it stalls the CPU. All are on by default and fall back safely.
+
+- **GPU/CPU overlap.** The resident experts are now *submitted* to the GPU and the CPU computes
+  the non-resident experts of the same block **while the GPU runs**, then the result is
+  synced and scattered. The expert phase costs ≈ `max(GPU, CPU)` instead of `GPU + CPU` — the
+  win grows with the non-resident fraction (i.e. it helps most at partial VRAM coverage).
+- **Faster expert kernels** (`COLI_CUDA_FAST_GEMV`). Warp-per-output-row int4 GEMV with a
+  `__shfl` reduction, and SiLU folded into the gate/up pass — one fewer kernel launch and one
+  fewer full read/write of the hidden buffer per expert block.
+- **Fewer dense round-trips.** Dense/attention/shared matmuls run on the device stream with
+  pinned staging (no legacy-default-stream global sync), and the shared expert goes through the
+  fused `expert_mlp` path (2 crossings + on-device SiLU vs. 6 round-trips + a CPU SiLU).
+- **Resident-KV GPU attention** (`CUDA_ATTN`). The K/V cache lives on the GPU in fp16 and is
+  appended one row at a time, so long-context decode no longer re-uploads the whole cache every
+  token; the softmax is parallelized instead of run serially on one thread.
+
+A single grouped-kernel failure no longer disables the GPU expert tier for the whole run — it
+now takes several consecutive failures (so one transient VRAM blip is tolerated), and GPU
+attention likewise falls back to the always-current host KV cache on any error.
+
 ---
 
 ## Build on RunPod (Linux + NVIDIA)
@@ -138,11 +161,13 @@ breakdown, and `COLI_CUDA_PROFILE=1` to get the grouped `h2d / kernel / d2h` spl
 | `--gpu 0` / `COLI_GPU=0` | off | Enable CUDA on device 0. |
 | `--vram N` / `CUDA_EXPERT_GB=N` | **auto** (free − reserve) | VRAM budget for resident experts. Unset ⇒ auto-fill the card. |
 | `CUDA_EGROUP` | **1** when a VRAM tier exists | Batched fused grouped-expert kernel. `0` = old per-tensor path. |
+| `COLI_CUDA_FAST_GEMV` | **1** | Warp-per-row int4 expert kernels with a fused SiLU (one pass instead of gate+up+silu+down). `0` = block-per-output path (fallback if the fast path ever misbehaves on your card). |
 | `CUDA_VRAM_RESERVE_GB` | `2` | VRAM held back from the expert tier for dense/attention/scratch. |
 | `CUDA_STREAM_EXPERTS` | `0` | JIT-stream *non-resident* int4 experts to the GPU. Helps **prefill / MTP** (many rows amortize the PCIe upload); usually a loss for single-token decode — leave off unless prefill-bound. |
 | `CUDA_STREAM_BATCH` | `8` | Max experts per streamed sub-batch (bounds VRAM scratch). |
-| `CUDA_DENSE` | `1` via `coli --gpu` | Keep dense + attention + shared-expert projections resident on the GPU. |
-| `CUDA_ATTN` | `0` | Run GQA attention on the GPU (float KV only; do **not** combine with `KV_I8=1`). |
+| `CUDA_DENSE` | `1` via `coli --gpu` | Keep dense + attention + shared-expert projections resident on the GPU. The shared expert runs as one fused `coli_cuda_expert_mlp` call (2 PCIe crossings + on-device SiLU) instead of six matmul round-trips. |
+| `CUDA_ATTN` | `0` | Run GQA attention on the GPU with a **resident fp16 KV cache**: only the new K/V row(s), the query and the context cross PCIe per token (not the whole cache), and the softmax is parallelized across the block. Float KV only — do **not** combine with `KV_I8=1`. Costs extra VRAM for the cache (~`Hkv·max_t·hd·2·2·layers` bytes); size `--vram` / `CUDA_VRAM_RESERVE_GB` to leave room. |
+| `CUDA_ATTN_SCRATCH_MB` | `256` | Per-call cap on the attention score scratch. GPU attention is used only when `S·H·nt·4 ≤` this, so long **prefills** (large `S`) stay on the CPU instead of allocating gigabytes; decode (`S`=1) is always well under it. |
 | `PRELOAD=1` | off | Fill VRAM **and** RAM at startup (whole-model resident minus the disk residual). |
 | `AUTOPIN=0` | autopin on | Skip history-based RAM autopin; forces the VRAM-first prefill (good for RAM-limited pods). |
 

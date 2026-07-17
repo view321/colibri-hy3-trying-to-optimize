@@ -40,6 +40,10 @@ typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                                           ColiCudaTensor *const *downs, const int *rows, int count,
                                           float *y, const float *x);
+typedef int            (*fn_expert_group_submit)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
+                                          ColiCudaTensor *const *downs, const int *rows, int count,
+                                          float *y, const float *x);
+typedef int            (*fn_expert_group_finish)(int device);
 typedef int            (*fn_expert_group_stream)(const void *const *gw, const void *const *uw,
                                           const void *const *dw, const float *const *gs,
                                           const float *const *us, const float *const *ds,
@@ -50,6 +54,10 @@ typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, 
                                               int R, int V, int K, int T, float attention_scale);
 typedef int            (*fn_gqa_attention)(float *ctx, const float *q, const float *k_cache,
                                           const float *v_cache, int S, int H, int Hkv, int hd,
+                                          int st0, int pos_base, int max_t, int device);
+typedef int            (*fn_gqa_attention_cached)(int layer, float *ctx, const float *q,
+                                          const float *k_new, const float *v_new,
+                                          int S, int H, int Hkv, int hd,
                                           int st0, int pos_base, int max_t, int device);
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
@@ -74,9 +82,12 @@ static struct {
     fn_group_stats     group_stats;
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
+    fn_expert_group_submit expert_group_submit;
+    fn_expert_group_finish expert_group_finish;
     fn_expert_group_stream expert_group_stream;
     fn_attention_absorb attention_absorb;
     fn_gqa_attention   gqa_attention;
+    fn_gqa_attention_cached gqa_attention_cached;
     fn_tensor_upload   tensor_upload;
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
@@ -84,7 +95,7 @@ static struct {
     fn_tensor_device   tensor_device;
 } g_cuda;
 
-/* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
+/* Resolve the DLL and all exported symbols. Returns 1 on success, 0 otherwise.
  * Idempotent: the first call (success or fail) sticks; later calls are no-ops
  * that return the cached result. The engine treats a 0 return as "CUDA
  * unavailable" and falls back to the CPU path without aborting. */
@@ -123,9 +134,12 @@ static int coli_cuda_load(void){
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
+    RESOLVE(expert_group_submit, fn_expert_group_submit)
+    RESOLVE(expert_group_finish, fn_expert_group_finish)
     RESOLVE(expert_group_stream, fn_expert_group_stream)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(gqa_attention,  fn_gqa_attention)
+    RESOLVE(gqa_attention_cached, fn_gqa_attention_cached)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
@@ -194,6 +208,18 @@ int coli_cuda_expert_group(ColiCudaTensor *const *gates, ColiCudaTensor *const *
     return g_cuda.expert_group(gates, ups, downs, rows, count, y, x);
 }
 
+int coli_cuda_expert_group_submit(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs, const int *rows, int count,
+                           float *y, const float *x){
+    if(!g_cuda.available) return 0;
+    return g_cuda.expert_group_submit(gates, ups, downs, rows, count, y, x);
+}
+
+int coli_cuda_expert_group_finish(int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.expert_group_finish(device);
+}
+
 int coli_cuda_expert_group_stream(const void *const *gw, const void *const *uw,
                                   const void *const *dw, const float *const *gs,
                                   const float *const *us, const float *const *ds,
@@ -215,6 +241,13 @@ int coli_cuda_gqa_attention(float *ctx, const float *q, const float *k_cache,
                             int st0, int pos_base, int max_t, int device){
     if(!g_cuda.available) return 0;
     return g_cuda.gqa_attention(ctx, q, k_cache, v_cache, S, H, Hkv, hd, st0, pos_base, max_t, device);
+}
+
+int coli_cuda_gqa_attention_cached(int layer, float *ctx, const float *q,
+                            const float *k_new, const float *v_new, int S, int H, int Hkv, int hd,
+                            int st0, int pos_base, int max_t, int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.gqa_attention_cached(layer, ctx, q, k_new, v_new, S, H, Hkv, hd, st0, pos_base, max_t, device);
 }
 
 int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,

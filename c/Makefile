@@ -152,7 +152,7 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h
 # compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
-# __declspec(dllexport) so the 11 API symbols are exported.
+# __declspec(dllexport) so the API symbols are exported.
 cuda-dll: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }

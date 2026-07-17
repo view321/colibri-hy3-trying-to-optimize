@@ -64,6 +64,17 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            const int *rows, int count,
                            float *y, const float *x);
 
+/* Split form of coli_cuda_expert_group for overlapping GPU expert work with CPU
+ * work: _submit enqueues on the device stream and returns without syncing; the
+ * caller does CPU-side work, then _finish syncs and lands the result into the `y`
+ * passed at submit. At most one submit may be outstanding per device. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_submit(ColiCudaTensor *const *gates,
+                           ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           float *y, const float *x);
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_finish(int device);
+
 /* Same as coli_cuda_expert_group but for NON-resident int4 experts: weights are
  * streamed from host slabs into device scratch each call (PCIe-bound). All experts
  * share shape (D,I) and fmt int4. rows/x/y layout matches coli_cuda_expert_group. */
@@ -81,6 +92,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *c
 /* GQA decode/prefill attention: ctx[S,H,hd] from q[S,H,hd] and float K/V caches. */
 COLI_CUDA_DLLEXPORT int coli_cuda_gqa_attention(float *ctx, const float *q,
                             const float *k_cache, const float *v_cache,
+                            int S, int H, int Hkv, int hd, int st0, int pos_base,
+                            int max_t, int device);
+
+/* Resident-cache GQA attention: appends the S new K/V rows (k_new/v_new,
+ * [S,Hkv,hd]) into a per-layer fp16 device cache and runs attention over the
+ * resident cache, so only the new rows, q and ctx cross PCIe each token. */
+COLI_CUDA_DLLEXPORT int coli_cuda_gqa_attention_cached(int layer, float *ctx, const float *q,
+                            const float *k_new, const float *v_new,
                             int S, int H, int Hkv, int hd, int st0, int pos_base,
                             int max_t, int device);
 

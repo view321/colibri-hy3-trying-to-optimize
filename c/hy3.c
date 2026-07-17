@@ -186,7 +186,9 @@ static int g_cuda_egroup;         /* CUDA_EGROUP: batch VRAM-resident experts th
 static int g_cuda_stream_experts; /* CUDA_STREAM_EXPERTS: JIT-stream RAM/disk experts to the GPU */
 static int g_cuda_stream_batch;   /* CUDA_STREAM_BATCH: max experts per streamed sub-batch (bounds VRAM scratch) */
 static int g_stream_off;          /* set after a streaming failure: fall back to CPU for the rest of the run */
-static int g_egroup_off;          /* set after a grouped-kernel failure: fall back (per-tensor GPU / CPU) for the rest of the run */
+static int g_egroup_off;          /* set after repeated grouped-kernel failures: fall back (per-tensor GPU / CPU) for the rest of the run */
+static int g_egroup_fail;         /* consecutive grouped-kernel failures; g_egroup_off trips after a few (a single transient OOM must not kill the GPU tier for the whole run) */
+static int g_attn_off;            /* set after a GPU-attention failure: fall back to CPU attention (host KV cache is always current) for the rest of the run */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -807,6 +809,17 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
+        /* The device call failed. A VRAM-prefilled expert has had its RAM copy freed
+         * (weights==NULL) — there is no CPU kernel to fall back to, so zero this
+         * output and keep the tensor GPU-eligible to retry next token rather than
+         * dereferencing a NULL weight pointer. Only mark cuda_failed (permanent CPU
+         * fallback) when a host copy actually exists. */
+        if(!w->qf && !w->q8 && !w->q4){
+            memset(y,0,(size_t)S*w->O*sizeof(float));
+            fprintf(stderr,"[CUDA] resident tensor [%d,%d] on device %d failed and has no RAM copy; output zeroed for this call\n",
+                w->O,w->I,w->cuda_device);
+            return;
+        }
         w->cuda_failed=1;
         fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
@@ -1554,10 +1567,26 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     float *ctx=falloc(qsz);
     int use_cuda=0;
 #ifdef COLI_CUDA
-    if(g_cuda_enabled&&g_cuda_attn&&!g_kv_i8&&m->K&&!m->attn_vis){
-        int st0=(m->kv_start&&m->kv_start[layer]>=0)?m->kv_start[layer]:0;
-        if(coli_cuda_gqa_attention(ctx,Q,m->K[layer],m->V[layer],S,H,Hkv,hd,st0,pos_base,m->max_t,g_cuda_devices[0]))
-            use_cuda=1;
+    /* Resident-cache GPU attention (CUDA_ATTN): append the S new K/V rows (Kp/Vp,
+     * already normed+roped and mirrored into the host cache above) to the per-layer
+     * fp16 device cache and attend over it — no per-token re-upload of the whole
+     * cache. Restricted to full-cache layers (kv_start==0, i.e. not the MTP partial
+     * layer) and to a bounded score-scratch size, so long prefills stay on the CPU
+     * (which parallelizes them well) rather than allocating gigabytes of VRAM. On any
+     * failure GPU attention is disabled for the rest of the run and the CPU path —
+     * which always keeps the host cache current — takes over, so no cache gap forms. */
+    if(g_cuda_enabled&&g_cuda_attn&&!g_attn_off&&!g_kv_i8&&m->K&&!m->attn_vis&&
+       m->kv_start&&m->kv_start[layer]>=0){
+        int st0=m->kv_start[layer];
+        int64_t nt_est=(int64_t)pos_base+S-st0;
+        int64_t scbytes=(int64_t)S*H*(nt_est>0?nt_est:1)*(int64_t)sizeof(float);
+        int64_t cap_mb=getenv("CUDA_ATTN_SCRATCH_MB")?atoll(getenv("CUDA_ATTN_SCRATCH_MB")):256;
+        if(scbytes<=cap_mb*1024*1024){
+            if(coli_cuda_gqa_attention_cached(layer,ctx,Q,Kp,Vp,S,H,Hkv,hd,st0,pos_base,m->max_t,g_cuda_devices[0]))
+                use_cuda=1;
+            else { g_attn_off=1;
+                fprintf(stderr,"[CUDA] GPU attention disabled after a failure; using CPU attention (host KV cache stays current)\n"); }
+        }
     }
 #endif
     if(!use_cuda){
@@ -1626,48 +1655,54 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
 }
 
 #ifdef COLI_CUDA
-/* Batch a block's experts onto the GPU. Sets handled[j]=1 for each expert whose
- * gate/up/down MLP was computed on-device and scattered (weighted) into `out`;
- * experts left 0 fall back to the CPU path in the caller. Two passes:
- *   (1) CUDA_EGROUP: VRAM-resident experts via one grouped kernel per device.
- *   (2) CUDA_STREAM_EXPERTS: non-resident int4 experts JIT-streamed over PCIe.
- * xbatch/ybatch are caller scratch of at least (sum Enr)*D floats. */
-static void moe_gpu_block(Model *m,ESlot **use,int nb,const int *Eoff,const int *Enr,
+/* Per-device pending grouped-expert submit (item 1: GPU/CPU overlap). Records the
+ * expert->row mapping and the ybatch slice so moe_gpu_finish can scatter after the
+ * CPU runs its share of the block concurrently. */
+typedef struct { int pending, cnt, jj[64], Rw[64]; int64_t yoff; } MoeDevPend;
+
+/* Submit a block's VRAM-resident experts to the GPU WITHOUT waiting, and (still
+ * synchronously) run any JIT-streamed non-resident experts. Marks gpu_pending[j]=1
+ * for each expert whose grouped call is in flight (its result is scattered later in
+ * moe_gpu_finish) and handled[j]=1 for streamed experts already scattered here.
+ * Each device fills a disjoint slice of xbatch/ybatch so their submits don't alias;
+ * the submit copies its input into pinned staging before returning, so xbatch is
+ * free to reuse immediately. */
+static void moe_gpu_submit(Model *m,ESlot **use,int nb,const int *Eoff,const int *Enr,
         const int *rows,const float *rw,const float *x,float *out,
-        float *xbatch,float *ybatch,int D,int I,char *handled){
-    /* Pass 1: VRAM-resident experts, grouped per device. */
+        float *xbatch,float *ybatch,int D,int I,char *handled,char *gpu_pending,MoeDevPend *pend){
+    for(int pd=0;pd<g_cuda_ndev;pd++){ pend[pd].pending=0; pend[pd].cnt=0; }
+    /* Pass 1: VRAM-resident experts, one grouped async submit per device. */
+    int64_t xoff=0;
     if(g_cuda_egroup && !g_egroup_off) for(int pd=0;pd<g_cuda_ndev;pd++){
         int dev=g_cuda_devices[pd];
-        ColiCudaTensor *G[64],*U[64],*Dn[64]; int Rw[64],jj[64],cnt=0; int64_t xoff=0;
-        for(int j=0;j<nb;j++){ if(handled[j]) continue; ESlot *e=use[j];
+        ColiCudaTensor *G[64],*U[64],*Dn[64]; int Rw[64],jj[64],cnt=0; int64_t dev_start=xoff;
+        for(int j=0;j<nb;j++){ if(handled[j]||gpu_pending[j]) continue; ESlot *e=use[j];
             if(e->g.cuda_eligible && e->g.cuda_device==dev){
                 for(int r=0;r<Enr[j];r++)
                     memcpy(xbatch+(xoff+r)*(int64_t)D,x+(int64_t)rows[Eoff[j]+r]*D,(size_t)D*sizeof(float));
                 G[cnt]=e->g.cuda; U[cnt]=e->u.cuda; Dn[cnt]=e->d.cuda; Rw[cnt]=Enr[j]; jj[cnt]=j; cnt++; xoff+=Enr[j];
             }
         }
-        if(cnt && coli_cuda_expert_group(G,U,Dn,Rw,cnt,ybatch,xbatch)){
-            int64_t yo=0;
-            for(int c=0;c<cnt;c++){ int j=jj[c];
-                for(int r=0;r<Rw[c];r++){ float *os=out+(int64_t)rows[Eoff[j]+r]*D, wgt=rw[Eoff[j]+r], *hr=ybatch+(yo+r)*(int64_t)D;
-                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-                handled[j]=1; yo+=Rw[c]; }
-            m->gpu_expert_calls+=cnt;
+        if(cnt && coli_cuda_expert_group_submit(G,U,Dn,Rw,cnt,ybatch+dev_start*(int64_t)D,xbatch+dev_start*(int64_t)D)){
+            pend[pd].pending=1; pend[pd].cnt=cnt; pend[pd].yoff=dev_start;
+            for(int c=0;c<cnt;c++){ pend[pd].jj[c]=jj[c]; pend[pd].Rw[c]=Rw[c]; gpu_pending[jj[c]]=1; }
+            g_egroup_fail=0;
         } else if(cnt){
-            /* One-shot: a failed grouped call leaves these experts unhandled; they
-             * fall through to the per-tensor GPU path (weights are still resident)
-             * or the CPU path. Stop retrying the batched kernel every token. */
-            g_egroup_off=1;
-            fprintf(stderr,"[CUDA] grouped expert kernel disabled after a failure; using per-tensor/CPU fallback\n");
+            /* Submit failed (e.g. transient VRAM pressure): these experts stay
+             * unhandled and fall through to the per-tensor GPU / CPU path. Only
+             * disable the batched kernel after several consecutive failures, so one
+             * blip doesn't kill the GPU tier for the whole run. */
+            if(++g_egroup_fail>=3){ g_egroup_off=1;
+                fprintf(stderr,"[CUDA] grouped expert kernel disabled after %d consecutive failures; using per-tensor/CPU fallback\n",g_egroup_fail); }
         }
     }
     /* Pass 2: non-resident int4 experts JIT-streamed to the primary device, in
      * bounded sub-batches so the weight scratch fits alongside a resident tier.
-     * A single failure (e.g. VRAM full) disables streaming for the rest of the
-     * run and falls back to CPU rather than spamming the OOM line every token. */
+     * Synchronous (its own stream sync); scattered here. A single failure disables
+     * streaming for the rest of the run rather than spamming the OOM line. */
     if(g_cuda_stream_experts && !g_stream_off){
         const void *gw[64],*uw[64],*dw[64]; const float *gs[64],*us[64],*ds[64];
-        int Rw[64],jj[64],cnt=0; int64_t xoff=0; int dev=g_cuda_devices[0];
+        int Rw[64],jj[64],cnt=0; int64_t sxoff=0; int dev=g_cuda_devices[0];
         int cap=(g_cuda_stream_batch>0&&g_cuda_stream_batch<64)?g_cuda_stream_batch:64;
         for(int j=0;j<=nb;j++){
             if((j==nb||cnt==cap)&&cnt){
@@ -1677,21 +1712,53 @@ static void moe_gpu_block(Model *m,ESlot **use,int nb,const int *Eoff,const int 
                         for(int r=0;r<Rw[c];r++){ float *os=out+(int64_t)rows[Eoff[jc]+r]*D, wgt=rw[Eoff[jc]+r], *hr=ybatch+(yo+r)*(int64_t)D;
                             for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                         handled[jc]=1; yo+=Rw[c]; }
-                    m->gpu_expert_calls+=cnt; cnt=0; xoff=0;
+                    m->gpu_expert_calls+=cnt; cnt=0; sxoff=0;
                 } else {
                     fprintf(stderr,"[CUDA] expert streaming disabled after a failure; using CPU (lower --vram or set CUDA_STREAM_BATCH smaller)\n");
                     g_stream_off=1; break;
                 }
             }
             if(j==nb) break;
-            if(handled[j]) continue; ESlot *e=use[j];
+            if(handled[j]||gpu_pending[j]) continue; ESlot *e=use[j];
             if(!e->g.cuda_eligible && e->g.fmt==2 && e->u.fmt==2 && e->d.fmt==2){
                 for(int r=0;r<Enr[j];r++)
-                    memcpy(xbatch+(xoff+r)*(int64_t)D,x+(int64_t)rows[Eoff[j]+r]*D,(size_t)D*sizeof(float));
+                    memcpy(xbatch+(sxoff+r)*(int64_t)D,x+(int64_t)rows[Eoff[j]+r]*D,(size_t)D*sizeof(float));
                 gw[cnt]=e->g.q4; gs[cnt]=e->g.s; uw[cnt]=e->u.q4; us[cnt]=e->u.s; dw[cnt]=e->d.q4; ds[cnt]=e->d.s;
-                Rw[cnt]=Enr[j]; jj[cnt]=j; cnt++; xoff+=Enr[j];
+                Rw[cnt]=Enr[j]; jj[cnt]=j; cnt++; sxoff+=Enr[j];
             }
         }
+    }
+}
+
+/* Sync each pending grouped submit and scatter its (weighted) result into `out`,
+ * marking those experts handled. Call after the CPU has processed the rest of the
+ * block, so GPU expert matmuls overlapped the CPU ones. If a finish fails, the
+ * experts it owned were already skipped by the CPU loop (gpu_pending), so recompute
+ * them here on the per-tensor GPU / CPU path rather than dropping their output. */
+static void moe_gpu_finish(Model *m,ESlot **use,const int *Eoff,const int *rows,
+        const float *rw,const float *x,float *out,float *ybatch,
+        float *xg,float *gg,float *uu,float *hh,int D,int I,MoeDevPend *pend,char *handled){
+    for(int pd=0;pd<g_cuda_ndev;pd++){
+        if(!pend[pd].pending) continue;
+        int ok=coli_cuda_expert_group_finish(g_cuda_devices[pd]);
+        int64_t yo=pend[pd].yoff;
+        for(int c=0;c<pend[pd].cnt;c++){ int j=pend[pd].jj[c]; int nr=pend[pd].Rw[c];
+            const int *er=rows+Eoff[j]; const float *ew=rw+Eoff[j];
+            if(ok){
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)er[r]*D, wgt=ew[r], *hr=ybatch+(yo+r)*(int64_t)D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+            }else{
+                for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)er[r]*D,(size_t)D*sizeof(float));
+                matmul_qt(gg,xg,&use[j]->g,nr); matmul_qt(uu,xg,&use[j]->u,nr);
+                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                matmul_qt(hh,gg,&use[j]->d,nr);
+                for(int r=0;r<nr;r++){ float *os=out+(int64_t)er[r]*D, wgt=ew[r], *hr=hh+(int64_t)r*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+            }
+            handled[j]=1; yo+=nr;
+        }
+        if(ok) m->gpu_expert_calls+=pend[pd].cnt;
+        pend[pd].pending=0;
     }
 }
 #endif
@@ -1783,12 +1850,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         char handled[64]; memset(handled,0,(size_t)nb);
         double t0=now_s();
 #ifdef COLI_CUDA
-        if(usegpu) moe_gpu_block(m,use,nb,Eoff,Enr,rows,rw,x,out,xbatch,ybatch,D,I,handled);
-#endif
-        /* CPU path for whatever the GPU did not take (non-resident experts, or all
-         * of them when the GPU tier is off). gpu_expert_calls is counted only where
-         * work actually runs on-device (moe_gpu_block), so this stat stays honest. */
+        /* Submit VRAM-resident experts to the GPU, run the non-resident experts on
+         * the CPU while the GPU computes, then finish+scatter — so the expert phase
+         * costs max(GPU,CPU) instead of GPU+CPU. gpu_pending marks the in-flight
+         * experts so the CPU loop skips them. gpu_expert_calls is counted only where
+         * work actually runs on-device, so the stat stays honest. */
+        char gpu_pending[64]; memset(gpu_pending,0,(size_t)nb);
+        MoeDevPend pend[COLI_CUDA_MAX_DEVICES];
+        if(usegpu) moe_gpu_submit(m,use,nb,Eoff,Enr,rows,rw,x,out,xbatch,ybatch,D,I,handled,gpu_pending,pend);
+        for(int j=0;j<nb;j++){ if(handled[j]||gpu_pending[j]) continue; ESlot *e=use[j]; int nr=Enr[j]; if(!nr) continue;
+#else
         for(int j=0;j<nb;j++){ if(handled[j]) continue; ESlot *e=use[j]; int nr=Enr[j]; if(!nr) continue;
+#endif
             const int *er=rows+Eoff[j]; const float *ew=rw+Eoff[j];
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)er[r]*D,(size_t)D*sizeof(float));
             matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
@@ -1797,6 +1870,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)er[r]*D, wgt=ew[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
         }
+#ifdef COLI_CUDA
+        if(usegpu) moe_gpu_finish(m,use,Eoff,rows,rw,x,out,ybatch,xg,gg,uu,hh,D,I,pend,handled);
+#endif
         m->t_emm+=now_s()-t0;
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];
           int promo=nmiss<m->ecap?nmiss:m->ecap;
@@ -1806,13 +1882,30 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
         }
     }
-    float *sg=falloc((int64_t)S*sI), *su=falloc((int64_t)S*sI);
-    matmul_qt(sg,x,&l->sh_gate,S); matmul_qt(su,x,&l->sh_up,S);
-    for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
-    matmul_qt(hh,sg,&l->sh_down,S);
-    for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+    /* Shared expert. Under CUDA_DENSE it is a resident MLP of exactly the shape
+     * coli_cuda_expert_mlp expects, so run it as one fused call (x in, y out,
+     * on-device SiLU) — 2 PCIe crossings instead of 6 matmul round-trips plus a
+     * CPU SiLU. Falls back to the CPU path on any upload/dispatch failure. */
+    int shared_done=0;
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && g_cuda_dense && l->sh_gate.cuda_eligible && l->sh_up.cuda_eligible &&
+       l->sh_down.cuda_eligible && !l->sh_gate.cuda_failed && !omp_in_parallel() &&
+       qt_cuda_upload(&l->sh_gate) && qt_cuda_upload(&l->sh_up) && qt_cuda_upload(&l->sh_down) &&
+       coli_cuda_expert_mlp(l->sh_gate.cuda,l->sh_up.cuda,l->sh_down.cuda,hh,x,S)){
+        for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+        shared_done=1;
+    }
+#endif
+    if(!shared_done){
+        float *sg=falloc((int64_t)S*sI), *su=falloc((int64_t)S*sI);
+        matmul_qt(sg,x,&l->sh_gate,S); matmul_qt(su,x,&l->sh_up,S);
+        for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
+        matmul_qt(hh,sg,&l->sh_down,S);
+        for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+        free(sg); free(su);
+    }
     free(logit); free(choice); free(idxs); free(ws); free(keff); free(uniq);
-    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(sg); free(su);
+    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw);
     if(xbatch) free(xbatch); if(ybatch) free(ybatch);
 }
 
