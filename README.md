@@ -230,7 +230,13 @@ Tuning: `--ram` sizes the cache budget; `--vram` + `--gpu` move hot experts to t
 
 ### CUDA expert tier (optional)
 
-Same three-tier model as GLM: **disk → RAM → VRAM**. Hot pinned experts can run GPU matmul during **token generation** (not during `[prefill] layer …` progress, which is mostly CPU attention + disk I/O).
+Same three-tier model as GLM: **disk → RAM → VRAM**. Hot pinned experts run GPU matmul during **token generation** (not during `[prefill] layer …` progress, which is mostly CPU attention + disk I/O).
+
+> **GPU acceleration is significantly reworked on the `gpu-accel` branch** so a single consumer
+> GPU (up to an RTX 5090) actually speeds up decode: the batched grouped-expert kernel is on by
+> default, the VRAM budget auto-sizes to the card, and a fresh model's VRAM tier is prefilled so
+> `--gpu 0` alone fills the card instead of leaving it idle. See **[GPU_ACCELERATION.md](GPU_ACCELERATION.md)**
+> for the build/run/benchmark guide. The engine still runs identically with no GPU.
 
 ```bash
 cd c

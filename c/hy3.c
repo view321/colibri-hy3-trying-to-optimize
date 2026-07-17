@@ -186,6 +186,7 @@ static int g_cuda_egroup;         /* CUDA_EGROUP: batch VRAM-resident experts th
 static int g_cuda_stream_experts; /* CUDA_STREAM_EXPERTS: JIT-stream RAM/disk experts to the GPU */
 static int g_cuda_stream_batch;   /* CUDA_STREAM_BATCH: max experts per streamed sub-batch (bounds VRAM scratch) */
 static int g_stream_off;          /* set after a streaming failure: fall back to CPU for the rest of the run */
+static int g_egroup_off;          /* set after a grouped-kernel failure: fall back (per-tensor GPU / CPU) for the rest of the run */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -1635,7 +1636,7 @@ static void moe_gpu_block(Model *m,ESlot **use,int nb,const int *Eoff,const int 
         const int *rows,const float *rw,const float *x,float *out,
         float *xbatch,float *ybatch,int D,int I,char *handled){
     /* Pass 1: VRAM-resident experts, grouped per device. */
-    if(g_cuda_egroup) for(int pd=0;pd<g_cuda_ndev;pd++){
+    if(g_cuda_egroup && !g_egroup_off) for(int pd=0;pd<g_cuda_ndev;pd++){
         int dev=g_cuda_devices[pd];
         ColiCudaTensor *G[64],*U[64],*Dn[64]; int Rw[64],jj[64],cnt=0; int64_t xoff=0;
         for(int j=0;j<nb;j++){ if(handled[j]) continue; ESlot *e=use[j];
@@ -1652,6 +1653,12 @@ static void moe_gpu_block(Model *m,ESlot **use,int nb,const int *Eoff,const int 
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 handled[j]=1; yo+=Rw[c]; }
             m->gpu_expert_calls+=cnt;
+        } else if(cnt){
+            /* One-shot: a failed grouped call leaves these experts unhandled; they
+             * fall through to the per-tensor GPU path (weights are still resident)
+             * or the CPU path. Stop retrying the batched kernel every token. */
+            g_egroup_off=1;
+            fprintf(stderr,"[CUDA] grouped expert kernel disabled after a failure; using per-tensor/CPU fallback\n");
         }
     }
     /* Pass 2: non-resident int4 experts JIT-streamed to the primary device, in
@@ -1778,12 +1785,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #ifdef COLI_CUDA
         if(usegpu) moe_gpu_block(m,use,nb,Eoff,Enr,rows,rw,x,out,xbatch,ybatch,D,I,handled);
 #endif
-        /* CPU path for whatever the GPU did not take (default: everything). */
+        /* CPU path for whatever the GPU did not take (non-resident experts, or all
+         * of them when the GPU tier is off). gpu_expert_calls is counted only where
+         * work actually runs on-device (moe_gpu_block), so this stat stays honest. */
         for(int j=0;j<nb;j++){ if(handled[j]) continue; ESlot *e=use[j]; int nr=Enr[j]; if(!nr) continue;
             const int *er=rows+Eoff[j]; const float *ew=rw+Eoff[j];
-#ifdef COLI_CUDA
-            if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
-#endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)er[r]*D,(size_t)D*sizeof(float));
             matmul_qt(gg,xg,&e->g,nr); matmul_qt(uu,xg,&e->u,nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
@@ -2421,6 +2427,89 @@ static void preload_all(Model *m, double ram_gb, int max_ctx){
     free(r);
 }
 
+#ifdef COLI_CUDA
+/* Fill the VRAM expert tier directly, up to the CUDA_EXPERT_GB budget, when no
+ * other residency path (PRELOAD / PIN / autopin-from-history) populated it.
+ *
+ * This is what makes the GPU do work on a FRESH model with no .coli_usage
+ * history: without it, `--gpu 0 --vram N` uploads nothing and the card sits idle
+ * (the VRAM tier is otherwise filled only by pin_load, which needs >=5000 logged
+ * selections, or by PRELOAD). Allocation is even per sparse layer — every MoE
+ * layer routes top-k of the same expert count, so uniform per-layer coverage
+ * maximizes the fraction of routes that land on a VRAM-resident expert under an
+ * unknown routing distribution. Within a layer the hottest experts go first when
+ * usage history exists. Uploaded experts have their RAM copy freed, so VRAM and
+ * RAM hold disjoint experts (max unique residency). Disk load is chunked and
+ * parallel (mirrors preload_all Phase A); CUDA uploads run serially. */
+static void cuda_vram_prefill(Model *m){
+    if(!g_cuda_enabled||g_cuda_expert_gb<=0||g_cuda_ndev<1) return;
+    Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,m->ebits); if(eb<=0) return;
+    int nsp=0; for(int l=0;l<c->n_layers;l++) if(m->L[l].sparse) nsp++;
+    if(m->has_mtp) nsp++;
+    if(nsp<1) return;
+    double remaining[COLI_CUDA_MAX_DEVICES]={0}, room_total=0;
+    double reserve=(getenv("CUDA_VRAM_RESERVE_GB")?atof(getenv("CUDA_VRAM_RESERVE_GB")):2.0)*1e9;
+    for(int i=0;i<g_cuda_ndev;i++){ size_t fb=0,tb=0;
+        if(coli_cuda_mem_info(g_cuda_devices[i],&fb,&tb)){
+            remaining[i]=(double)fb-(double)g_cuda_dense_projected[i]-reserve;
+            if(remaining[i]<0) remaining[i]=0; room_total+=remaining[i]; } }
+    double budget=g_cuda_expert_gb*1e9; if(budget>room_total) budget=room_total;
+    if(budget<(double)eb) return;
+    int per_layer=(int)(budget/(double)nsp/(double)eb); if(per_layer<1) per_layer=1;
+    if(per_layer>c->n_experts) per_layer=c->n_experts;
+
+    int Lmax=c->n_layers+(m->has_mtp?1:0);
+    typedef struct { int l,e,slot; } Pre;
+    Pre *pl=malloc((size_t)per_layer*(size_t)nsp*sizeof(Pre)); int np=0;
+    int *order=malloc((size_t)c->n_experts*sizeof(int));
+    for(int l=0;l<Lmax;l++){
+        int is_mtp=(l==c->n_layers);
+        if(!is_mtp && !m->L[l].sparse) continue;
+        if(!m->pin[l]) m->pin[l]=calloc(c->n_experts,sizeof(ESlot));
+        for(int e=0;e<c->n_experts;e++) order[e]=e;
+        uint32_t *use=m->eusage?m->eusage[l]:NULL;   /* hottest first when history exists */
+        if(use) for(int a=1;a<c->n_experts;a++){ int ke=order[a]; uint32_t kv=use[ke]; int b=a-1;
+            while(b>=0&&use[order[b]]<kv){ order[b+1]=order[b]; b--; } order[b+1]=ke; }
+        for(int k=0;k<per_layer;k++){ int slot=m->npin[l]++; pl[np++]=(Pre){l,order[k],slot}; }
+    }
+    free(order);
+
+    double t0=now_s(); int64_t vbytes=0; int placed=0, stop=0;
+    const int CH=256;
+    for(int base=0; base<np && !stop; base+=CH){
+        int cnt=np-base<CH?np-base:CH;
+        #pragma omp parallel for schedule(dynamic,1)
+        for(int a=base;a<base+cnt;a++) expert_load(m,pl[a].l,pl[a].e,&m->pin[pl[a].l][pl[a].slot]);
+        for(int a=base;a<base+cnt;a++){
+            ESlot *s=&m->pin[pl[a].l][pl[a].slot];
+            int dev=-1; for(int i=0;i<g_cuda_ndev;i++)
+                if(remaining[i]>=(double)eb&&(dev<0||remaining[i]>remaining[dev])) dev=i;
+            if(dev<0){ stop=1; continue; }   /* VRAM full: remaining experts stay RAM-pinned */
+            s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[dev];
+            s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+            if(qt_cuda_upload(&s->g)&&qt_cuda_upload(&s->u)&&qt_cuda_upload(&s->d)){
+                int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                              +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                              +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                remaining[dev]-=actual; vbytes+=actual; placed++;
+                compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;
+                free(s->fslab); s->fslab=NULL; s->fslab_cap=0;
+                s->g.q4=s->u.q4=s->d.q4=NULL; s->g.q8=s->u.q8=s->d.q8=NULL; s->g.s=s->u.s=s->d.s=NULL;
+            } else {   /* upload failed: keep this expert as a RAM pin, treat device as full */
+                qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                remaining[dev]=0;
+            }
+        }
+    }
+    free(pl);
+    fprintf(stderr,"[CUDA] VRAM prefill: %d experts resident (%.2f GB), ~%d/layer x %d layers in %.0fs%s\n",
+        placed,vbytes/1e9,per_layer,nsp,now_s()-t0,
+        placed<np?" — VRAM budget reached; the rest stay in RAM/disk (LRU)":"");
+}
+#endif
+
 static int g_repin=0;
 static uint64_t g_last_repin=0;
 typedef struct { long gain; int l, slot, eid; } RepinCand;
@@ -2842,9 +2931,31 @@ int main(int argc, char **argv){
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_attn=getenv("CUDA_ATTN")?atoi(getenv("CUDA_ATTN")):0;
     g_cuda_expert_gb=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB")):0;
-    g_cuda_egroup=getenv("CUDA_EGROUP")?atoi(getenv("CUDA_EGROUP")):0;
     g_cuda_stream_experts=getenv("CUDA_STREAM_EXPERTS")?atoi(getenv("CUDA_STREAM_EXPERTS")):0;
     g_cuda_stream_batch=getenv("CUDA_STREAM_BATCH")?atoi(getenv("CUDA_STREAM_BATCH")):8;
+    /* Auto-size the VRAM expert tier when the user enabled CUDA but gave no budget
+     * (e.g. `--gpu 0` with no `--vram`). Without a budget nothing becomes resident
+     * and the GPU sits idle, so fill (free VRAM − reserve) across the devices.
+     * The reserve leaves room for CUDA_DENSE tensors and the egroup/attention
+     * scratch; per-device placement below applies its own reserve on top. */
+    if(g_cuda_enabled && !getenv("CUDA_EXPERT_GB")){
+        size_t sumfree=0;
+        for(int i=0;i<g_cuda_ndev;i++){ size_t fb=0,tb=0;
+            if(coli_cuda_mem_info(g_cuda_devices[i],&fb,&tb)) sumfree+=fb; }
+        double resv=(getenv("CUDA_VRAM_RESERVE_GB")?atof(getenv("CUDA_VRAM_RESERVE_GB")):2.0)*1e9;
+        double budget=(double)sumfree-resv; if(budget<0) budget=0;
+        g_cuda_expert_gb=budget/1e9;
+        if(g_cuda_expert_gb>0)
+            fprintf(stderr,"[CUDA] auto VRAM expert budget: %.1f GB (free %.1f GB over %d device(s), reserve %.1f GB) — set CUDA_EXPERT_GB / --vram to override\n",
+                g_cuda_expert_gb,sumfree/1e9,g_cuda_ndev,resv/1e9);
+    }
+    /* Batched expert kernel: on by default whenever there is a VRAM expert tier.
+     * This is what makes a VRAM-resident expert actually accelerate — one fused
+     * grouped gate/up/down/silu call per 64-expert block (pinned async copies, a
+     * single sync) instead of the per-tensor matmul path's 3 synchronous PCIe
+     * round-trips per expert. Set CUDA_EGROUP=0 to force the old per-tensor path,
+     * or CUDA_EGROUP=1 to force it on even with no resident tier. */
+    g_cuda_egroup=getenv("CUDA_EGROUP")?atoi(getenv("CUDA_EGROUP")):((g_cuda_enabled&&g_cuda_expert_gb>0)?1:0);
     if((g_cuda_egroup||g_cuda_stream_experts)&&!g_cuda_enabled){ fprintf(stderr,"CUDA_EGROUP/CUDA_STREAM_EXPERTS require COLI_CUDA=1\n"); return 2; }
     if(g_cuda_enabled&&(g_cuda_egroup||g_cuda_stream_experts))
         fprintf(stderr,"[CUDA] expert batching: egroup=%d stream=%d\n",g_cuda_egroup,g_cuda_stream_experts);
@@ -2879,7 +2990,8 @@ int main(int argc, char **argv){
     }
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"WARNING: model on %s (slow 9p mount). Use ext4 (e.g. /home/ or native /mnt/d/) for speed.\n",snap);
-    if(getenv("PIN")&&!getenv("PRELOAD")) pin_load(&m,getenv("PIN"),getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);
+    int pinned_any=0;
+    if(getenv("PIN")&&!getenv("PRELOAD")){ pin_load(&m,getenv("PIN"),getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0); pinned_any=1; }
     { double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
@@ -2887,14 +2999,23 @@ int main(int argc, char **argv){
       if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
       if(getenv("PRELOAD")){
           preload_all(&m,ram_env,est_ctx);   /* whole model resident: VRAM + RAM, disk only for the residual */
+          pinned_any=1;
       } else {
           int autopin=getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
           if(!getenv("PIN")&&autopin&&hist>=5000){
               double conf=(double)hist/200000.0; if(conf>1) conf=1;
               double pin_gb=expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
-              if(pin_gb>=0.5) pin_load(&m,g_usage_path,pin_gb);
+              if(pin_gb>=0.5){ pin_load(&m,g_usage_path,pin_gb); pinned_any=1; }
           }
       }
+#ifdef COLI_CUDA
+      /* GPU tier requested but nothing filled it (fresh model with no usage
+       * history, or AUTOPIN=0): fill VRAM directly so the card is actually used.
+       * Without this, `--gpu --vram N` on a fresh model leaves VRAM empty and the
+       * engine runs CPU/RAM-only despite the GPU being enabled. */
+      if(g_cuda_enabled && g_cuda_expert_gb>0 && !pinned_any) cuda_vram_prefill(&m);
+#endif
+      (void)pinned_any;   /* only consumed by the CUDA prefill above */
       cap_for_ram(&m,ram_env,ebits,est_ctx); }
 
     const char *stats=getenv("STATS");
