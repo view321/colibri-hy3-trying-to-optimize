@@ -1986,7 +1986,13 @@ static void preload_all(Model *m, double ram_gb, int max_ctx){
     if(g_cuda_enabled && g_cuda_expert_gb>0){ max_vram=(int)(g_cuda_expert_gb*1e9/eb); if(max_vram>n) max_vram=n; }
     if(max_vram>0){
         double vbudget=g_cuda_expert_gb*1e9; size_t fb=0,tb=0;
-        if(coli_cuda_mem_info(g_cuda_devices[0],&fb,&tb)){ double safe=(double)fb-2e9; if(safe<0)safe=0; if(vbudget>safe)vbudget=safe; }
+        if(coli_cuda_mem_info(g_cuda_devices[0],&fb,&tb)){
+            /* Leave room for lazily-uploaded dense tensors (CUDA_DENSE) and the runtime
+             * egroup/attention scratch — otherwise those OOM and fall back to CPU. */
+            double reserve=(getenv("CUDA_VRAM_RESERVE_GB")?atof(getenv("CUDA_VRAM_RESERVE_GB")):3.0)*1e9;
+            double safe=(double)fb-(double)g_cuda_dense_projected[0]-reserve; if(safe<0)safe=0;
+            if(vbudget>safe)vbudget=safe;
+        }
         int stop=0, CH=256;
         for(int base=0; base<max_vram && !stop; base+=CH){
             int cnt=max_vram-base<CH?max_vram-base:CH;
