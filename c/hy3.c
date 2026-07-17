@@ -2398,6 +2398,42 @@ static void run_prompt_ids(Model *m, int ngen){
     free(prompt); free(out);
 }
 
+/* NUMA interleave: spread the resident model across every memory controller.
+ * Decode is RAM-bandwidth bound, so on a multi-socket / multi-node box a default
+ * first-touch (node-local) placement caps throughput at ONE node's bandwidth and
+ * makes cores on other nodes pay a cross-socket penalty. Interleaving the pages
+ * round-robin over all nodes gives every core the aggregate bandwidth. Equivalent
+ * to `numactl --interleave=all`, but built in and — critically — also applied to
+ * the OpenMP worker pool, because those threads first-touch the expert slabs during
+ * PRELOAD/load, so THEIR policy governs where the pages land. Auto-on when >1 node;
+ * set NUMA_INTERLEAVE=0 to force node-local. Pure libc syscall, no libnuma dep. */
+#if defined(__linux__)
+#include <sys/syscall.h>
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
+static int numa_online_nodes(void){
+    FILE *f=fopen("/sys/devices/system/node/online","r"); if(!f) return 1;
+    int lo=0,hi=0,nr=fscanf(f,"%d-%d",&lo,&hi); fclose(f);
+    if(nr<1) return 1; if(nr<2) hi=lo; return hi+1;
+}
+static void numa_setup(void){
+    const char *e=getenv("NUMA_INTERLEAVE"); int want=e?atoi(e):-1;   /* -1 = auto */
+    if(want==0) return;
+    int nodes=numa_online_nodes();
+    if(nodes<2){ if(want>0) fprintf(stderr,"[NUMA] single node — interleave not needed\n"); return; }
+    unsigned long mask=0; int nb=nodes<(int)(8*sizeof(mask))?nodes:(int)(8*sizeof(mask));
+    for(int i=0;i<nb;i++) mask|=1UL<<i;
+    unsigned long maxnode=8*sizeof(mask);
+    if(syscall(SYS_set_mempolicy,MPOL_INTERLEAVE,&mask,maxnode)!=0){ perror("[NUMA] set_mempolicy"); return; }
+    #pragma omp parallel
+    { syscall(SYS_set_mempolicy,MPOL_INTERLEAVE,&mask,maxnode); }   /* propagate to the OpenMP pool */
+    fprintf(stderr,"[NUMA] MPOL_INTERLEAVE across %d nodes (set NUMA_INTERLEAVE=0 to disable)\n",nodes);
+}
+#else
+static void numa_setup(void){}
+#endif
+
 int main(int argc, char **argv){
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack=getenv("NOPACK")?1:0;
@@ -2463,6 +2499,7 @@ int main(int argc, char **argv){
 #endif
     printf("== Hy3 C engine, cache=%d experts/layer | experts@%d-bit dense@%d-bit ==\n",cap,ebits,dbits);
     g_mem_avail_boot=mem_available_gb();
+    numa_setup();   /* set interleave BEFORE any model allocation / first-touch */
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0) g_draft=m.has_mtp?3:0;
     fprintf(stderr,"[MTP] %s (draft=%d)\n",
