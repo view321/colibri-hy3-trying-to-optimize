@@ -288,6 +288,7 @@ Same idea as [GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibr
 - Full-model chat (fixed serve KV alloc)
 - MTP speculative decode (auto-enabled when `out-mtp-*.safetensors` present; `DRAFT=3` default; optional `TREE_DRAFT=1`)
 - int8 IDOT integer matmul kernels on by default (avx512-vnni / avx-vnni / avx2 / neon, exactness-tested by `tests/test_idot_hy3.c`; `IDOT=0` for the exact f32 path). Build with `ARCH=native` to unlock the VNNI kernels on CPUs that have them (Zen 4+/Sapphire Rapids+: avx512-vnni, Alder Lake+: avx-vnni).
+- 4-row-blocked idot matmuls (weight row loaded and int4-unpacked once per 4 batch rows, 4 independent accumulator chains: ~1.2-1.4x on MTP verify forwards, up to ~1.8x on int4 prefill, measured on AVX2) and a vectorized serial activation quantizer (~20x; it was an Amdahl term at high thread counts).
 - Performance knobs: AVX2 attention, `KV_I8=1` int8 KV, `PERF=1` breakdown, `PIPE=2` io_uring loads, `CUDA_ATTN=1` GPU attention, NUMA page interleave (`NUMA=0` to disable)
 - `coli chat` / `coli serve` / `coli convert` / `coli plan` / `coli doctor`
 
