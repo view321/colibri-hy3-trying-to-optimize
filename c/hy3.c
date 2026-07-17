@@ -162,6 +162,12 @@ typedef struct {
     uint64_t eclock, hits, miss, ereq;
     uint32_t **eusage;
     uint32_t **eheat;
+    /* cross-layer expert prediction (PREDICT): per-layer bitmask of experts
+     * predicted for that layer's NEXT visit, readahead-hinted from an earlier
+     * layer. Consumed (measured + cleared) when the layer's moe() runs. */
+    uint64_t **pred_mask; int *pred_np;
+    float *pred_nrm, *pred_logit, *pred_choice;  /* prediction scratch (main thread only) */
+    uint64_t pred_hit, pred_seen, pred_issued;
     /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
     int has_mtp; Layer mtpL; QT eh_proj;
     float *enorm, *hnorm, *mtp_norm;
@@ -272,6 +278,8 @@ static float g_nuc=0.90f;
 static int g_topk=0;
 static float g_topp=0;
 static int g_draft=-1;   /* -1 = auto: 3 se MTP, 0 senza */
+static int g_predict=0;    /* PREDICT: layers ahead to predict+prefetch routed experts (0=off) */
+static int g_predict_k=0;  /* PREDICT_K: experts hinted per predicted layer (0=auto: topk) */
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
@@ -1414,6 +1422,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->pin=calloc(nrows,sizeof(ESlot*)); m->npin=calloc(nrows,sizeof(int));
     m->eusage=calloc(nrows,sizeof(uint32_t*));
     m->eheat=calloc(nrows,sizeof(uint32_t*));
+    m->pred_mask=calloc(nrows,sizeof(uint64_t*));
+    m->pred_np=calloc(nrows,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
@@ -1450,6 +1460,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->pred_mask[i]=calloc((c->n_experts+63)/64,sizeof(uint64_t));
         }
         #undef P
     }
@@ -1523,10 +1534,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->pred_mask[i]=calloc((c->n_experts+63)/64,sizeof(uint64_t));
             #undef PM
         }
     }
     m->hlast=falloc(D); m->h_all=falloc((int64_t)64*D);
+    m->pred_nrm=falloc(D); m->pred_logit=falloc(c->n_experts); m->pred_choice=falloc(c->n_experts);
     int64_t rb=qt_bytes(&m->embed);
     if(m->lm_head.qf!=m->embed.qf&&m->lm_head.q8!=m->embed.q8&&m->lm_head.q4!=m->embed.q4)
         rb+=qt_bytes(&m->lm_head);
@@ -1814,8 +1827,63 @@ static void moe_gpu_finish(Model *m,ESlot **use,const int *Eoff,const int *rows,
 }
 #endif
 
+/* Cross-layer expert prediction + prefetch (PREDICT=N layers ahead).
+ *
+ * At decode there is no natural prefetch window: a layer's routed experts are known
+ * only after its own attention, so every MoE layer serially eats the latency of its
+ * ~topk cold disk reads. But the residual stream drifts slowly between layers, so
+ * running a FUTURE layer's router on the CURRENT residual predicts that layer's
+ * top-k with high overlap. This issues async page-cache readahead (st_prefetch /
+ * fadvise WILLNEED) for the predicted experts now; by the time the walk reaches
+ * layer T, expert_load()'s synchronous preads hit warm pages instead of cold NVMe.
+ *
+ * Speculation only warms the page cache — the real router still routes, a wrong
+ * guess just stays a cold read, and output is bit-identical with PREDICT on or off.
+ * Each prediction is recorded in pred_mask[T] and scored when layer T actually
+ * routes (pred_hit/pred_seen), so the hit rate is measurable, not vibes.
+ * Skipped under DIRECT=1 (O_DIRECT bypasses the cache these hints warm) and a
+ * no-op on Windows (posix_fadvise shims away). Experts already pinned (incl.
+ * VRAM-resident) or in the LRU are recorded but not hinted. */
+static void predict_prefetch(Model *m, int layer, const float *xres, int S){
+    Cfg *c=&m->c; int D=c->hidden, E=c->n_experts;
+    if(E>4096) return;                 /* have[] below is sized for E<=4096, like moe()'s seen[] */
+    int PK=g_predict_k>0?g_predict_k:c->topk;
+    if(PK>E) PK=E; if(PK>64) PK=64;
+    /* the MTP layer is a target only when drafts actually run it (g_draft<0 = auto-on with MTP) */
+    int nrows=c->n_layers+((m->has_mtp&&g_draft!=0)?1:0);
+    for(int d=1;d<=g_predict;d++){
+        int T=layer+d; if(T>=nrows) break;
+        Layer *Lt=T<c->n_layers?&m->L[T]:&m->mtpL;
+        if(!Lt->sparse||!Lt->router||!m->pred_mask[T]) continue;
+        uint64_t *mask=m->pred_mask[T];
+        /* presence bitmap for layer T (pin incl. VRAM-resident + LRU): scanned once
+         * per target instead of once per candidate — npin can be thousands. */
+        uint64_t have[64]; int words=(E+63)/64;
+        memset(have,0,(size_t)words*sizeof(uint64_t));
+        ESlot *P=m->pin[T];
+        for(int z=0;z<m->npin[T];z++){ int e=P[z].eid; if(e>=0&&e<E) have[e>>6]|=1ull<<(e&63); }
+        ESlot *Sl=m->ecache[T];
+        for(int z=0;z<m->ecn[T];z++){ int e=Sl[z].eid; if(e>=0&&e<E) have[e>>6]|=1ull<<(e&63); }
+        for(int s=0;s<S;s++){
+            rmsnorm(m->pred_nrm,xres+(int64_t)s*D,Lt->post_ln,D,c->eps);
+            matmul(m->pred_logit,m->pred_nrm,Lt->router,1,D,E);
+            for(int e=0;e<E;e++) m->pred_choice[e]=sigmoidf(m->pred_logit[e])+Lt->router_bias[e];
+            int idx[64];
+            for(int kk=0;kk<PK;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
+                    if(!tk&&m->pred_choice[e]>bv){bv=m->pred_choice[e];best=e;} }
+                if(best<0) break;
+                idx[kk]=best;
+                if(mask[best>>6]>>(best&63)&1) continue;   /* already predicted for T */
+                mask[best>>6]|=1ull<<(best&63); m->pred_np[T]++;
+                if(!(have[best>>6]>>(best&63)&1)){ expert_prefetch(m,T,best); m->pred_issued++; }
+            }
+        }
+    }
+}
+
 /* MoE: HYV3TopKRouter math (sigmoid, bias for selection, normalize, router_scaling_factor) */
-static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
+static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     int sI=c->moe_inter*c->n_shared;
     float *logit=falloc(E), *choice=falloc(E);
@@ -1853,6 +1921,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
         int e=idxs[(int64_t)s*K+kk]; if(!seen[e]){ seen[e]=1; uniq[nu++]=e; }
     }
+    /* Score + consume the prediction armed for this layer's visit. Stats count only
+     * small-S forwards (decode / MTP verify): a prefill visit unions most experts
+     * and would inflate the hit rate, but it still clears the mask so a stale
+     * prediction never lingers into the next decode step. */
+    if(g_predict&&m->pred_mask[layer]&&m->pred_np[layer]){
+        uint64_t *pmask=m->pred_mask[layer];
+        if(S<=8) for(int q=0;q<nu;q++){ int e=uniq[q]; m->pred_seen++;
+            if(pmask[e>>6]>>(e&63)&1) m->pred_hit++; }
+        memset(pmask,0,(size_t)((E+63)/64)*sizeof(uint64_t));
+        m->pred_np[layer]=0;
+    }
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc((size_t)S*K*sizeof(int)); float *rw=malloc((size_t)S*K*sizeof(float));
     float *xbatch=NULL,*ybatch=NULL;
@@ -1888,6 +1967,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(!found) expert_prefetch(m,layer,eid);
             }
         }
+        /* Predict + readahead-hint the experts of the NEXT layer(s) now, after this
+         * layer's own (critical-path) loads were dispatched: the hints run in kernel
+         * background while this layer waits on its misses and matmuls. Decode/MTP
+         * only — prefill (large S) unions most experts and has the block prefetch. */
+        if(g_predict&&base==0&&S<=8) predict_prefetch(m,layer,xres,S);
         /* Wait for every pending disk load in this block before any compute, so the
          * GPU batch below sees all experts resident in RAM. */
         for(int j=0;j<nb;j++) if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk+=now_s()-tw; }
@@ -1966,7 +2050,7 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D,x+(int64_t)s*D,l->post_ln,D,c->eps);
-    if(l->sparse) moe(m,l,li,nrm,S,tmp);
+    if(l->sparse) moe(m,l,li,nrm,x,S,tmp);
     else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
 }
@@ -2806,6 +2890,11 @@ static void profile_print(Model *m, double elapsed){
     double acc=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
     printf("PROFILE: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs | lm_head %.3fs | other %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_head,elapsed-acc);
+    if(g_predict&&m->pred_seen)
+        printf("PREDICT: depth=%d | routed-expert prediction hit %.1f%% (%llu/%llu) | %llu readahead hints issued\n",
+            g_predict,100.0*m->pred_hit/m->pred_seen,
+            (unsigned long long)m->pred_hit,(unsigned long long)m->pred_seen,
+            (unsigned long long)m->pred_issued);
 }
 
 static void perf_report(Model *m){
@@ -3114,6 +3203,25 @@ int main(int argc, char **argv){
     g_repin=getenv("REPIN")?atoi(getenv("REPIN")):0;
     g_draft=getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
     if(g_draft>63) g_draft=63;
+    /* Cross-layer expert prediction + prefetch. On by default: it is hint-only
+     * (output is bit-identical), and it converts decode's per-layer synchronous
+     * disk waits into background readahead. Off under DIRECT=1 — O_DIRECT reads
+     * bypass the page cache that the hints warm. */
+    g_predict=getenv("PREDICT")?atoi(getenv("PREDICT")):2;
+    if(g_predict<0) g_predict=0;
+    if(g_predict>8) g_predict=8;
+    g_predict_k=getenv("PREDICT_K")?atoi(getenv("PREDICT_K")):0;
+    if(g_predict&&g_direct){
+        fprintf(stderr,"[PREDICT] disabled: DIRECT=1 bypasses the page cache the prefetch hints warm\n");
+        g_predict=0;
+    }
+    if(g_predict){
+        if(g_predict_k>0)
+            fprintf(stderr,"[PREDICT] cross-layer expert prefetch: %d layer(s) ahead, %d experts/layer (PREDICT=0 to disable)\n",
+                g_predict,g_predict_k);
+        else
+            fprintf(stderr,"[PREDICT] cross-layer expert prefetch: %d layer(s) ahead (PREDICT=0 to disable)\n",g_predict);
+    }
     int cap=argc>1?atoi(argv[1]):64;
     int ebits=argc>2?atoi(argv[2]):8;
     int dbits=argc>3?atoi(argv[3]):ebits;

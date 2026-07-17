@@ -162,10 +162,10 @@ breakdown, and `COLI_CUDA_PROFILE=1` to get the grouped `h2d / kernel / d2h` spl
 | `--vram N` / `CUDA_EXPERT_GB=N` | **auto** (free − reserve) | VRAM budget for resident experts. Unset ⇒ auto-fill the card. |
 | `CUDA_EGROUP` | **1** when a VRAM tier exists | Batched fused grouped-expert kernel. `0` = old per-tensor path. |
 | `COLI_CUDA_FAST_GEMV` | **1** | Warp-per-row int4 expert kernels with a fused SiLU (one pass instead of gate+up+silu+down). `0` = block-per-output path (fallback if the fast path ever misbehaves on your card). |
-| `CUDA_VRAM_RESERVE_GB` | `2` | VRAM held back from the expert tier for dense/attention/scratch. |
+| `CUDA_VRAM_RESERVE_GB` | `3` (hy3) / `2` (glm) | VRAM held back from the expert tier for not-yet-resident dense tensors, GPU-attention KV and kernel scratch. The expert fills re-probe **actual** free VRAM before every upload and stop while this reserve is still physically free (byte accounting alone undercounts: `cudaMalloc` rounds each allocation to ~2 MB driver granules). |
 | `CUDA_STREAM_EXPERTS` | `0` | JIT-stream *non-resident* int4 experts to the GPU. Helps **prefill / MTP** (many rows amortize the PCIe upload); usually a loss for single-token decode — leave off unless prefill-bound. |
 | `CUDA_STREAM_BATCH` | `8` | Max experts per streamed sub-batch (bounds VRAM scratch). |
-| `CUDA_DENSE` | `1` via `coli --gpu` | Keep dense + attention + shared-expert projections resident on the GPU. The shared expert runs as one fused `coli_cuda_expert_mlp` call (2 PCIe crossings + on-device SiLU) instead of six matmul round-trips. |
+| `CUDA_DENSE` | `1` via `coli --gpu` | Keep dense + attention + shared-expert projections resident on the GPU. On hy3 they upload **eagerly at startup, before any expert tier fills** (dense runs every token, so it outranks experts; lazy upload used to race the expert fill for leftover VRAM and lose). The shared expert runs as one fused `coli_cuda_expert_mlp` call (2 PCIe crossings + on-device SiLU) instead of six matmul round-trips. |
 | `CUDA_ATTN` | `0` | Run GQA attention on the GPU with a **resident fp16 KV cache**: only the new K/V row(s), the query and the context cross PCIe per token (not the whole cache), and the softmax is parallelized across the block. Float KV only — do **not** combine with `KV_I8=1`. Costs extra VRAM for the cache (~`Hkv·max_t·hd·2·2·layers` bytes); size `--vram` / `CUDA_VRAM_RESERVE_GB` to leave room. |
 | `CUDA_ATTN_SCRATCH_MB` | `256` | Per-call cap on the attention score scratch. GPU attention is used only when `S·H·nt·4 ≤` this, so long **prefills** (large `S`) stay on the CPU instead of allocating gigabytes; decode (`S`=1) is always well under it. |
 | `PRELOAD=1` | off | Fill VRAM **and** RAM at startup (whole-model resident minus the disk residual). |
@@ -181,7 +181,14 @@ breakdown, and `COLI_CUDA_PROFILE=1` to get the grouped `h2d / kernel / d2h` spl
 - **Startup is slow** — the prefill reads ~`--vram` GB from disk once. Lower `--vram`, or
   put the model on fast local NVMe (not a slow network volume).
 - **OOM on the card** — raise `CUDA_VRAM_RESERVE_GB` (e.g. `4`) or lower `--vram`. Dense
-  (`CUDA_DENSE`) and GPU attention (`CUDA_ATTN`) also consume VRAM.
+  (`CUDA_DENSE`) and GPU attention (`CUDA_ATTN`) also consume VRAM. The hy3 fills probe
+  live free memory per upload and roll back experts if an upload still OOMs, so a decode
+  flooded by `tensor allocation: out of memory` / `output zeroed` lines means the reserve
+  is undersized for your context/attention settings — raise it.
+- **`resident tensor … output zeroed` during decode** — VRAM was over-committed and a
+  resident expert call could not get scratch; that expert's contribution is lost for the
+  call (degraded output quality, loudly warned once). Lower `--vram` or raise
+  `CUDA_VRAM_RESERVE_GB`; with the live-probe fills this should no longer occur.
 - **`COLI_CUDA_TC_INT4=1` produces garbage on a 5090** — the sub-byte tensor-core (s4 WMMA)
   path only compiles on `sm_75..sm_89` (Turing/Ampere/Ada). Blackwell removed that type, so
   the kernel is a no-op there. Leave `COLI_CUDA_TC_INT4` **off** on `sm_90+`; the default

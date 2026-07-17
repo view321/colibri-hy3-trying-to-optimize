@@ -107,6 +107,8 @@ Works on 16 GB RAM; experts matmul on CPU. Slower decode, same memory story.
 | **`DIRECT=1`** | `O_DIRECT` disk reads on NVMe. |
 | **`PIPE=1`** | Async expert prefetch via thread pool (helps when cache is small). |
 | **`PIPE=2`** | io_uring expert reads (needs `make hy3 IOURING=1`; falls back to `PIPE=1`). |
+| **`PREDICT=N`** | Cross-layer expert prediction + prefetch, **default 2** layers ahead: run future layers' routers on the current residual and issue async readahead for the predicted experts, so decode's per-layer disk waits overlap compute. Hint-only — output is bit-identical. `PREDICT=0` disables. Auto-off under `DIRECT=1` (O_DIRECT bypasses the page cache the hints warm); no-op on Windows. |
+| **`PREDICT_K=N`** | Experts hinted per predicted layer (default: `topk`). |
 | **`KV_I8=1`** | int8 KV cache (~4× smaller KV RAM; float in-flight row for current position). |
 | **`IDOT=0`** | Disable the int8-activation integer matmul kernels (on by default: avx512-vnni / avx-vnni / avx2 / neon, ~2-3× on quantized matmuls, ~0.3% RMS noise per matmul). Set 0 for the exact f32 dequant path. |
 | **`NUMA=0`** | Disable automatic page interleave (enabled by default when >1 memory node is visible; evens out per-thread bandwidth on multi-socket/multi-die boxes). |
@@ -228,6 +230,39 @@ Tuning: `--ram` sizes the cache budget; `--vram` + `--gpu` move hot experts to t
 
 **Throughput numbers:** mid-stream `[t=N] … tok/s` and the chat footer’s **decode** rate measure generation only (from first emitted token). The footer’s **total** rate includes prefill for that turn (full prompt on turn 1, incremental new tokens on follow-ups). Example: `└─ 38 tok · 0.10 tok/s total · 0.24 tok/s decode · …`.
 
+### Cross-layer expert prediction (PREDICT, default on)
+
+At decode a layer's routed experts are known only after its own attention runs, so every
+MoE layer serially eats the latency of its ~8 cold disk reads — ~79 synchronous IO stalls
+per token, with nothing overlapping them. But the residual stream drifts slowly between
+layers: running a **future** layer's router on the **current** residual predicts that
+layer's top-k with high overlap. The engine now does exactly that (`PREDICT=2` layers
+ahead by default) and issues async page-cache readahead (`fadvise WILLNEED`) for predicted
+experts that aren't already pinned or cached, right after the current layer's own loads
+are dispatched. By the time the walk reaches the predicted layer, its `pread`s hit warm
+pages instead of cold NVMe.
+
+Prediction is **speculation on IO only**: the real router still routes, a wrong guess just
+stays a cold read, and output is bit-identical with `PREDICT` on or off. Every prediction
+is scored against the routing that actually happens and reported at the end of the run:
+
+```
+PREDICT: depth=2 | routed-expert prediction hit 78.4% (12345/15748) | 2345 readahead hints issued
+```
+
+Notes: needs buffered IO (auto-disabled under `DIRECT=1`); `posix_fadvise` is a no-op on
+Windows, so the prediction runs but hints do nothing there; prefill keeps its existing
+per-block prefetch (prediction gates itself to decode / MTP-verify forwards, `S<=8`).
+
+A/B it on a fixed prompt (compare the decode `tok/s` and `expert-disk` seconds; the win
+shows on cold/partially-warm caches, where decode is disk-latency-bound):
+
+```bash
+M=/path/to/hy3_i4
+SNAP=$M TEMP=0 PROMPT="Explain how a jet engine works." NGEN=64 PREDICT=0 ./hy3 64 4 8  # off
+SNAP=$M TEMP=0 PROMPT="Explain how a jet engine works." NGEN=64            ./hy3 64 4 8  # on (default: 2 ahead)
+```
+
 ### CUDA expert tier (optional)
 
 Same three-tier model as GLM: **disk → RAM → VRAM**. Hot pinned experts run GPU matmul during **token generation** (not during `[prefill] layer …` progress, which is mostly CPU attention + disk I/O).
@@ -296,6 +331,7 @@ Same idea as [GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibr
 - int8 IDOT integer matmul kernels on by default (avx512-vnni / avx-vnni / avx2 / neon, exactness-tested by `tests/test_idot_hy3.c`; `IDOT=0` for the exact f32 path). Build with `ARCH=native` to unlock the VNNI kernels on CPUs that have them (Zen 4+/Sapphire Rapids+: avx512-vnni, Alder Lake+: avx-vnni).
 - 4-row-blocked idot matmuls (weight row loaded and int4-unpacked once per 4 batch rows, 4 independent accumulator chains: ~1.2-1.4x on MTP verify forwards, up to ~1.8x on int4 prefill, measured on AVX2) and a vectorized serial activation quantizer (~20x; it was an Amdahl term at high thread counts).
 - Performance knobs: AVX2 attention, `KV_I8=1` int8 KV, `PERF=1` breakdown, `PIPE=2` io_uring loads, `CUDA_ATTN=1` GPU attention, NUMA page interleave (`NUMA=0` to disable)
+- Cross-layer expert prediction + prefetch (`PREDICT=2` default): future layers' routers run on the current residual and readahead-hint their predicted experts, overlapping decode's per-layer disk waits with compute; hit rate is measured and printed (`PREDICT:` line). Hint-only — token-exact with the feature on or off.
 - `coli chat` / `coli serve` / `coli convert` / `coli plan` / `coli doctor`
 
 **Not yet**
