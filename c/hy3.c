@@ -1949,6 +1949,95 @@ static void pin_load(Model *m, const char *statspath, double gb){
     free(r); free(cnt_l);
 }
 
+/* PRELOAD=1: make (almost) the whole expert set resident at startup instead of
+ * streaming it on demand. Fills the VRAM tier first with the hottest experts and
+ * frees their RAM copy (so VRAM and RAM hold DISJOINT experts — maximizing unique
+ * residency), then fills RAM up to the --ram budget. Whatever fits in neither stays
+ * on disk and is served by the LRU. Unlike pin_load: no 4096 cap, no usage history
+ * required (usage only orders which experts get the VRAM tier). */
+typedef struct { int l, e; uint32_t h; } PreRec;
+static int prerec_cmp(const void *A, const void *B){
+    uint32_t a=((const PreRec*)A)->h, b=((const PreRec*)B)->h;
+    return a<b ? 1 : (a>b ? -1 : 0);   /* hottest first */
+}
+static void preload_all(Model *m, double ram_gb, int max_ctx){
+    Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,m->ebits);
+    int total=0;
+    for(int l=0;l<c->n_layers;l++) if(m->L[l].sparse) total+=c->n_experts;
+    if(m->has_mtp) total+=c->n_experts;
+    if(total<1) return;
+    PreRec *r=malloc((size_t)total*sizeof(PreRec)); int n=0;
+    for(int l=0;l<c->n_layers;l++) if(m->L[l].sparse) for(int e=0;e<c->n_experts;e++){
+        uint32_t h=(m->eusage&&m->eusage[l])?m->eusage[l][e]:0; r[n++]=(PreRec){l,e,h}; }
+    if(m->has_mtp){ int l=c->n_layers; for(int e=0;e<c->n_experts;e++){
+        uint32_t h=(m->eusage&&m->eusage[l])?m->eusage[l][e]:0; r[n++]=(PreRec){l,e,h}; } }
+    qsort(r,n,sizeof(PreRec),prerec_cmp);
+    for(int l=0;l<c->n_layers;l++) if(m->L[l].sparse) m->pin[l]=calloc(c->n_experts,sizeof(ESlot));
+    if(m->has_mtp) m->pin[c->n_layers]=calloc(c->n_experts,sizeof(ESlot));
+
+    double avail=expert_avail(m,ram_gb,m->ebits,max_ctx);
+    int64_t ram_cap_b=(int64_t)(avail-6e9); if(ram_cap_b<0) ram_cap_b=0;   /* leave ~6 GB for the overflow LRU + scratch */
+    double tl=now_s();
+    int64_t ram_bytes=0,vram_bytes=0; int ram_n=0,vram_n=0,va=0;
+#ifdef COLI_CUDA
+    /* Phase A: VRAM tier — chunked so peak staging RAM stays ~one chunk. Load a chunk
+     * into RAM, upload each expert to the GPU, then free its RAM copy. */
+    int max_vram=0;
+    if(g_cuda_enabled && g_cuda_expert_gb>0){ max_vram=(int)(g_cuda_expert_gb*1e9/eb); if(max_vram>n) max_vram=n; }
+    if(max_vram>0){
+        double vbudget=g_cuda_expert_gb*1e9; size_t fb=0,tb=0;
+        if(coli_cuda_mem_info(g_cuda_devices[0],&fb,&tb)){ double safe=(double)fb-2e9; if(safe<0)safe=0; if(vbudget>safe)vbudget=safe; }
+        int stop=0, CH=256;
+        for(int base=0; base<max_vram && !stop; base+=CH){
+            int cnt=max_vram-base<CH?max_vram-base:CH;
+            #pragma omp parallel for schedule(dynamic,1)
+            for(int a=base;a<base+cnt;a++){ int li=r[a].l,slot;
+                #pragma omp critical
+                { slot=m->npin[li]++; }
+                r[a].h=(uint32_t)slot; expert_load(m,li,r[a].e,&m->pin[li][slot]); }
+            for(int a=base;a<base+cnt;a++){
+                ESlot *s=&m->pin[r[a].l][r[a].h];
+                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+                if(!stop && (double)(vram_bytes+need)<=vbudget){
+                    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[0];
+                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+                    if(qt_cuda_upload(&s->g)&&qt_cuda_upload(&s->u)&&qt_cuda_upload(&s->d)){
+                        vram_bytes+=need; vram_n++; m->gpu_expert_count++; m->gpu_expert_bytes+=need;
+                        compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;
+                        free(s->fslab); s->fslab=NULL; s->fslab_cap=0;
+                        s->g.q4=s->u.q4=s->d.q4=NULL; s->g.q8=s->u.q8=s->d.q8=NULL; s->g.s=s->u.s=s->d.s=NULL;
+                        continue;
+                    }
+                    qt_cuda_reset(&s->g);qt_cuda_reset(&s->u);qt_cuda_reset(&s->d);
+                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                    stop=1;
+                } else stop=1;
+                ram_bytes+=eb; ram_n++;   /* budget hit or upload failed: keep this one in RAM */
+            }
+            va=base+cnt;
+        }
+    }
+#endif
+    /* Phase B: RAM tier — parallel-load the next slice up to the RAM budget. */
+    int n_ram_more=(int)((ram_cap_b-ram_bytes)/eb); if(n_ram_more<0) n_ram_more=0;
+    int rb_end=va+n_ram_more; if(rb_end>n) rb_end=n;
+    #pragma omp parallel for schedule(dynamic,1)
+    for(int a=va;a<rb_end;a++){ int li=r[a].l,slot;
+        #pragma omp critical
+        { slot=m->npin[li]++; }
+        expert_load(m,li,r[a].e,&m->pin[li][slot]); }
+    ram_n+=rb_end-va; ram_bytes+=(int64_t)(rb_end-va)*eb;
+    m->resident_bytes+=ram_bytes;
+    int on_disk=n-vram_n-ram_n;
+    fprintf(stderr,"[PRELOAD] %d/%d experts resident: %d VRAM (%.1f GB) + %d RAM (%.1f GB); %d on disk (%.1f GB) in %.0fs\n",
+        vram_n+ram_n,n,vram_n,vram_bytes/1e9,ram_n,ram_bytes/1e9,on_disk,(double)on_disk*eb/1e9,now_s()-tl);
+    if(on_disk>0) fprintf(stderr,"[PRELOAD] note: %d experts still stream from disk — raise --ram/--vram to make them resident\n",on_disk);
+#if defined(__linux__)||defined(__APPLE__)
+    if(getenv("PRELOAD_MLOCK")) pin_wire(m);   /* hard-wire RAM residency (needs ulimit -l) */
+#endif
+    free(r);
+}
+
 static int g_repin=0;
 static uint64_t g_last_repin=0;
 typedef struct { long gain; int l, slot, eid; } RepinCand;
@@ -2383,17 +2472,21 @@ int main(int argc, char **argv){
     }
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"WARNING: model on %s (slow 9p mount). Use ext4 (e.g. /home/ or native /mnt/d/) for speed.\n",snap);
-    if(getenv("PIN")) pin_load(&m,getenv("PIN"),getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);
+    if(getenv("PIN")&&!getenv("PRELOAD")) pin_load(&m,getenv("PIN"),getenv("PIN_GB")?atof(getenv("PIN_GB")):10.0);
     { double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       int64_t hist=usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
-      int autopin=getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
-      if(!getenv("PIN")&&autopin&&hist>=5000){
-          double conf=(double)hist/200000.0; if(conf>1) conf=1;
-          double pin_gb=expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
-          if(pin_gb>=0.5) pin_load(&m,g_usage_path,pin_gb);
+      if(getenv("PRELOAD")){
+          preload_all(&m,ram_env,est_ctx);   /* whole model resident: VRAM + RAM, disk only for the residual */
+      } else {
+          int autopin=getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
+          if(!getenv("PIN")&&autopin&&hist>=5000){
+              double conf=(double)hist/200000.0; if(conf>1) conf=1;
+              double pin_gb=expert_avail(&m,ram_env,ebits,est_ctx)*0.5*conf/1e9;
+              if(pin_gb>=0.5) pin_load(&m,g_usage_path,pin_gb);
+          }
       }
       cap_for_ram(&m,ram_env,ebits,est_ctx); }
 
