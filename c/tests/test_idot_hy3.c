@@ -16,10 +16,20 @@ static uint32_t xr(void){ rng_state^=rng_state<<13; rng_state^=rng_state>>17; rn
 static int32_t ref_i8i8(const int8_t *w, const int8_t *x, int I){
     int64_t s=0; for(int i=0;i<I;i++) s+=(int32_t)w[i]*x[i]; return (int32_t)s;
 }
-static int32_t ref_i4i8(const uint8_t *w4, const int8_t *x, int I){
+/* raw-offset references: the u-kernels dot the stored offset codes ([0,15]/[0,3])
+ * directly; the caller subtracts offset*rowsum(x) to recover the signed dot. */
+static int32_t ref_i4u(const uint8_t *w4, const int8_t *x, int I){
     int64_t s=0;
-    for(int i=0;i<I;i++){ uint8_t b=w4[i>>1]; int v=(i&1)?((int)(b>>4)-8):((int)(b&0xF)-8); s+=v*x[i]; }
+    for(int i=0;i<I;i++){ uint8_t b=w4[i>>1]; int v=(i&1)?(int)(b>>4):(int)(b&0xF); s+=v*x[i]; }
     return (int32_t)s;
+}
+static int32_t ref_i2u(const uint8_t *w2, const int8_t *x, int I){
+    int64_t s=0;
+    for(int i=0;i<I;i++){ uint8_t b=w2[i>>2]; s+=(int)((b>>((i&3)*2))&3)*x[i]; }
+    return (int32_t)s;
+}
+static int32_t ref_rowsum(const int8_t *x, int I){
+    int64_t s=0; for(int i=0;i<I;i++) s+=x[i]; return (int32_t)s;
 }
 
 /* Reference copy of the ORIGINAL scalar qrow_i8 — the vectorized one must match
@@ -32,7 +42,7 @@ static float ref_qrow_i8(const float *x, int8_t *q, int I){
 
 int main(void){
     static const int sizes[]={1,2,15,16,17,31,32,33,63,64,65,100,127,128,1408,4096,4097};
-    static int8_t w[8192], x[8192]; static uint8_t w4[4096];
+    static int8_t w[8192], x[8192]; static uint8_t w4[4096], w2[2048];
     static int8_t x4[4*8192];
     for(unsigned t=0;t<sizeof(sizes)/sizeof(sizes[0]);t++){
         int I=sizes[t];
@@ -42,32 +52,40 @@ int main(void){
             if(rep==0) for(int i=0;i<I;i++) w[i]=-128;                    /* sign-trick edge case */
             if(rep==1) for(int i=0;i<I;i++){ w[i]=127; x[i]=(int8_t)(i&1?-127:127); }
             for(int i=0;i<(I+1)/2;i++) w4[i]=(uint8_t)(xr()&0xFF);
+            for(int i=0;i<(I+3)/4;i++) w2[i]=(uint8_t)(xr()&0xFF);
             int32_t got=dot_i8i8(w,x,I), want=ref_i8i8(w,x,I);
             if(got!=want){ fprintf(stderr,"FAIL dot_i8i8 I=%d rep=%d: %d != %d\n",I,rep,got,want); return 1; }
-            got=dot_i4i8(w4,x,I); want=ref_i4i8(w4,x,I);
-            if(got!=want){ fprintf(stderr,"FAIL dot_i4i8 I=%d rep=%d: %d != %d\n",I,rep,got,want); return 1; }
+            got=dot_i4i8u(w4,x,I); want=ref_i4u(w4,x,I);
+            if(got!=want){ fprintf(stderr,"FAIL dot_i4i8u I=%d rep=%d: %d != %d\n",I,rep,got,want); return 1; }
+            got=dot_i2i8u(w2,x,I); want=ref_i2u(w2,x,I);
+            if(got!=want){ fprintf(stderr,"FAIL dot_i2i8u I=%d rep=%d: %d != %d\n",I,rep,got,want); return 1; }
+            got=rowsum_i8(x,I); want=ref_rowsum(x,I);
+            if(got!=want){ fprintf(stderr,"FAIL rowsum_i8 I=%d rep=%d: %d != %d\n",I,rep,got,want); return 1; }
             /* 4-row blocked kernels vs 4 independent reference dots */
             for(int i=0;i<4*I;i++) x4[i]=(int8_t)((int)(xr()%255)-127);
-            int32_t o8[4], o4[4];
-            dotrow_i8i8_x4(w,x4,I,o8); dotrow_i4i8_x4(w4,x4,I,o4);
+            int32_t o8[4], o4[4], o2[4];
+            dotrow_i8i8_x4(w,x4,I,o8); dotrow_i4i8u_x4(w4,x4,I,o4); dotrow_i2i8u_x4(w2,x4,I,o2);
             for(int k=0;k<4;k++){
                 if(o8[k]!=ref_i8i8(w,x4+(int64_t)k*I,I)){
                     fprintf(stderr,"FAIL dotrow_i8i8_x4 I=%d rep=%d row=%d\n",I,rep,k); return 1; }
-                if(o4[k]!=ref_i4i8(w4,x4+(int64_t)k*I,I)){
-                    fprintf(stderr,"FAIL dotrow_i4i8_x4 I=%d rep=%d row=%d\n",I,rep,k); return 1; }
+                if(o4[k]!=ref_i4u(w4,x4+(int64_t)k*I,I)){
+                    fprintf(stderr,"FAIL dotrow_i4i8u_x4 I=%d rep=%d row=%d\n",I,rep,k); return 1; }
+                if(o2[k]!=ref_i2u(w2,x4+(int64_t)k*I,I)){
+                    fprintf(stderr,"FAIL dotrow_i2i8u_x4 I=%d rep=%d row=%d\n",I,rep,k); return 1; }
             }
         }
     }
     /* blocked matmul wrappers vs the same math done row-by-row (bit-exact floats:
      * identical operation order (float)dot*sc*sx per element on both sides) */
     { static float xf[9*4097], y[9*33], yref[9*33]; static int8_t xq[9*4097]; static float sx[9];
-      static int8_t q8[33*4097]; static uint8_t q4[33*2049]; static float sc[33];
+      static int8_t q8[33*4097]; static uint8_t q4[33*2049], q2[33*1025]; static float sc[33];
       static const int Ss[]={1,2,3,4,5,8,9};
       int O=33;
       for(unsigned ti=0;ti<sizeof(sizes)/sizeof(sizes[0]);ti+=3){
         int I=sizes[ti+2<17?ti+2:16]; if(I>4097) I=4097;
         for(int i=0;i<O*I;i++) q8[i]=(int8_t)((int)(xr()%256)-128);
         for(int i=0;i<O*((I+1)/2);i++) q4[i]=(uint8_t)(xr()&0xFF);
+        for(int i=0;i<O*((I+3)/4);i++) q2[i]=(uint8_t)(xr()&0xFF);
         for(int o=0;o<O;o++) sc[o]=((int)(xr()%1000)+1)/500.0f;
         for(unsigned si=0;si<sizeof(Ss)/sizeof(Ss[0]);si++){
             int S=Ss[si];
@@ -78,11 +96,20 @@ int main(void){
                 yref[(int64_t)s*O+o]=(float)ref_i8i8(q8+(int64_t)o*I,xq+(int64_t)s*I,I)*sc[o]*sx[s];
             for(int i=0;i<S*O;i++) if(y[i]!=yref[i]){
                 fprintf(stderr,"FAIL matmul_q_idot I=%d S=%d idx=%d\n",I,S,i); return 1; }
+            /* offset form: kernel computes (float)(raw - off*rowsum)*sc*sx; the ref
+             * uses the same integer identity, so equality must be bit-exact */
             matmul_i4_idot(y,xq,sx,q4,sc,S,I,O);
-            for(int s=0;s<S;s++) for(int o=0;o<O;o++)
-                yref[(int64_t)s*O+o]=(float)ref_i4i8(q4+(int64_t)o*((I+1)/2),xq+(int64_t)s*I,I)*sc[o]*sx[s];
+            for(int s=0;s<S;s++){ int32_t rs=8*ref_rowsum(xq+(int64_t)s*I,I);
+                for(int o=0;o<O;o++)
+                    yref[(int64_t)s*O+o]=(float)(ref_i4u(q4+(int64_t)o*((I+1)/2),xq+(int64_t)s*I,I)-rs)*sc[o]*sx[s]; }
             for(int i=0;i<S*O;i++) if(y[i]!=yref[i]){
                 fprintf(stderr,"FAIL matmul_i4_idot I=%d S=%d idx=%d\n",I,S,i); return 1; }
+            matmul_i2_idot(y,xq,sx,q2,sc,S,I,O);
+            for(int s=0;s<S;s++){ int32_t rs=2*ref_rowsum(xq+(int64_t)s*I,I);
+                for(int o=0;o<O;o++)
+                    yref[(int64_t)s*O+o]=(float)(ref_i2u(q2+(int64_t)o*((I+3)/4),xq+(int64_t)s*I,I)-rs)*sc[o]*sx[s]; }
+            for(int i=0;i<S*O;i++) if(y[i]!=yref[i]){
+                fprintf(stderr,"FAIL matmul_i2_idot I=%d S=%d idx=%d\n",I,S,i); return 1; }
         }
       }
     }

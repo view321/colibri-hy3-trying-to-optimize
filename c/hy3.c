@@ -370,11 +370,11 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "scalar"
 #endif
 static int g_idot=1, g_nopack=0, g_drop=0, g_direct=0;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static int g_i4s=1;   /* SDOT: int4 IDOT pays even at S=1 (measured on M-series, see glm.c) */
-#else
-static int g_i4s=2;   /* x86: f32 AVX2 path wins at S=1 (glm's measurement); I4S=1 to re-tune */
-#endif
+/* int4/int2 IDOT at every S, including S=1 decode. glm's original x86 measurement
+ * (f32 path wins at S=1) predates the raw-offset kernels: without the sub/sign work
+ * the offset form measures 1.9x FASTER than the f32 path at S=1 on plain AVX2
+ * ([1536,4096], qrow included). I4S=N restores a threshold if a machine disagrees. */
+static int g_i4s=1;
 static int g_perf=0, g_kv_i8=0, g_tree_draft=0;
 /* Activation row -> int8 (absmax/127). Runs SERIAL (before the OMP matmul region),
  * so at high thread counts the scalar version is a real Amdahl term on every decode
@@ -476,73 +476,64 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
     return sum;
 }
-/* dot int4(packed)·int8: nibble -> int8 [-8,7] on the fly, then same sign trick */
-static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
+/* dot int4(packed)·int8 — OFFSET form. The container stores nibbles as w+8 in
+ * [0,15]; instead of widening to signed and sign-tricking, dot the RAW unsigned
+ * nibbles (vpdpbusd/maddubs's natural u8 operand) and let the caller subtract
+ * 8*rowsum(x) once per activation row: sum((w'-8)*x) = sum(w'*x) - 8*sum(x),
+ * an exact integer identity. Kills the sub/abs/sign work in the hot loop.
+ * Bounds: pairs <= 15*127*2 = 3810 < 32767; total <= 15*127*16384 ~ 3.2e7 s32. */
+static inline int32_t dot_i4i8u(const uint8_t *w4, const int8_t *x, int I){
     int32_t sum=0; int i=0;
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-    /* 32 bytes = 64 nibbles -> int8 in [-8,7], one vpdpbusd per 64 values.
-     * 256-bit unpack leaves values in per-128-lane order [0-15][32-47]/[16-31][48-63];
-     * dot pairing is order-invariant, so permute x's 128-bit blocks to match
-     * instead of re-ordering w (one vpermq per iter, off the critical unpack path). */
+    /* 32 bytes = 64 nibbles, one vpdpbusd per 64 values. The 256-bit unpack leaves
+     * values in per-128-lane order [0-15][32-47]/[16-31][48-63]; permute the WEIGHT
+     * vector back to natural order (the index is an involution) so x loads stay
+     * sequential — in the 4-row kernel that is 1 permute instead of 4. */
     const __m256i m4v=_mm256_set1_epi8(0x0F);
-    const __m512i b8v=_mm512_set1_epi8(8);
-    const __m512i xidx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
+    const __m512i widx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
     __m512i acc=_mm512_setzero_si512();
     for(;i+64<=I;i+=64){
         __m256i by=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
         __m256i lo=_mm256_and_si256(by,m4v), hi=_mm256_and_si256(_mm256_srli_epi16(by,4),m4v);
         __m256i z0=_mm256_unpacklo_epi8(lo,hi), z1=_mm256_unpackhi_epi8(lo,hi);
-        __m512i wv=_mm512_sub_epi8(_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1),b8v);
-        __m512i xv=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x+i)));
-        __mmask64 neg=_mm512_movepi8_mask(wv);
-        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
-        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+        __m512i wv=_mm512_permutexvar_epi64(widx,_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1));
+        acc=_mm512_dpbusd_epi32(acc,wv,_mm512_loadu_si512((const void*)(x+i)));
     }
     sum=_mm512_reduce_add_epi32(acc);
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
-    /* AVX-VNNI 128-bit, int4: 16 bytes = 32 nibbles -> int8 [-8,7] in two halves
-     * (n0/n1), each fed to a 16-byte vpdpbusd. Same 128-bit unpack as the AVX2
-     * branch below; 32 elements/iter. */
-    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    const __m128i m4=_mm_set1_epi8(0x0F);
     __m128i acc=_mm_setzero_si128();
     for(;i+32<=I;i+=32){
         __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 bytes = 32 nibbles */
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);  /* in order */
-        __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
-        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
-        __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
-        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
-        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+        acc=_mm_dpbusd_epi32(acc,_mm_unpacklo_epi8(lo,hi),_mm_loadu_si128((const __m128i*)(x+i)));
+        acc=_mm_dpbusd_epi32(acc,_mm_unpackhi_epi8(lo,hi),_mm_loadu_si128((const __m128i*)(x+i+16)));
     }
     sum=hsum128_i32(acc);
 #elif defined(__AVX2__)
-    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
+    const __m128i m4=_mm_set1_epi8(0x0F);
     const __m256i ones=_mm256_set1_epi16(1);
     __m256i acc=_mm256_setzero_si256();
     for(;i+32<=I;i+=32){
         __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 bytes = 32 nibbles */
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);   /* in order */
-        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
-        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
-        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        __m256i wv=_mm256_set_m128i(_mm_unpackhi_epi8(lo,hi),_mm_unpacklo_epi8(lo,hi));
+        __m256i p=_mm256_maddubs_epi16(wv,_mm256_loadu_si256((const __m256i*)(x+i)));
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
 #elif defined(__ARM_NEON)
-    const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+    const uint8x16_t m4q=vdupq_n_u8(0x0F);
     int32x4_t acc=vdupq_n_s32(0);
     for(;i+32<=I;i+=32){
         uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 bytes = 32 nibbles */
-        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibbles in order */
-        int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
-        int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* raw nibbles in order */
+        int8x16_t w0=vreinterpretq_s8_u8(z.val[0]), w1=vreinterpretq_s8_u8(z.val[1]);
         int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
 #if defined(__ARM_FEATURE_DOTPROD)
-        acc=vdotq_s32(acc,w0,x0); acc=vdotq_s32(acc,w1,x1);
+        acc=vdotq_s32(acc,w0,x0); acc=vdotq_s32(acc,w1,x1);          /* w in [0,15]: s8-safe */
 #else
-        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: no overflow */
+        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* w<=15: no overflow */
         p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
         acc=vpadalq_s16(acc,p);
         p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
@@ -552,8 +543,8 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     }
     sum=vaddvq_s32(acc);
 #endif
-    for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
-    if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
+    for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=(int)(b&0xF)*x[i]+(int)(b>>4)*x[i+1]; }
+    if(i<I){ uint8_t b=w4[i>>1]; sum+=(int)(b&0xF)*x[i]; }
     return sum;
 }
 /* ---- 4-row blocked variants: one weight row × 4 activation rows per pass.
@@ -615,77 +606,152 @@ static inline void dotrow_i8i8_x4(const int8_t *w, const int8_t *xq, int I, int3
     for(;i<I;i++){ int wi=w[i];
         out[0]+=wi*x0[i]; out[1]+=wi*x1[i]; out[2]+=wi*x2[i]; out[3]+=wi*x3[i]; }
 }
-static inline void dotrow_i4i8_x4(const uint8_t *w4, const int8_t *xq, int I, int32_t *out){
+static inline void dotrow_i4i8u_x4(const uint8_t *w4, const int8_t *xq, int I, int32_t *out){
     const int8_t *x0=xq, *x1=xq+(int64_t)I, *x2=xq+2*(int64_t)I, *x3=xq+3*(int64_t)I;
     int i=0;
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* raw-offset form: unpack once, ONE weight permute (vs 4 x-permutes in the
+     * signed form), no abs/mask_sub — per row just load + vpdpbusd. */
     const __m256i m4v=_mm256_set1_epi8(0x0F);
-    const __m512i b8v=_mm512_set1_epi8(8);
-    const __m512i xidx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
+    const __m512i widx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
     __m512i a0=_mm512_setzero_si512(),a1=a0,a2=a0,a3=a0;
     for(;i+64<=I;i+=64){
         __m256i by=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
         __m256i lo=_mm256_and_si256(by,m4v), hi=_mm256_and_si256(_mm256_srli_epi16(by,4),m4v);
         __m256i z0=_mm256_unpacklo_epi8(lo,hi), z1=_mm256_unpackhi_epi8(lo,hi);
-        __m512i wv=_mm512_sub_epi8(_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1),b8v);
-        __m512i wa=_mm512_abs_epi8(wv); __mmask64 neg=_mm512_movepi8_mask(wv);
-        __m512i v0=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x0+i)));
-        __m512i v1=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x1+i)));
-        __m512i v2=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x2+i)));
-        __m512i v3=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x3+i)));
-        a0=_mm512_dpbusd_epi32(a0,wa,_mm512_mask_sub_epi8(v0,neg,_mm512_setzero_si512(),v0));
-        a1=_mm512_dpbusd_epi32(a1,wa,_mm512_mask_sub_epi8(v1,neg,_mm512_setzero_si512(),v1));
-        a2=_mm512_dpbusd_epi32(a2,wa,_mm512_mask_sub_epi8(v2,neg,_mm512_setzero_si512(),v2));
-        a3=_mm512_dpbusd_epi32(a3,wa,_mm512_mask_sub_epi8(v3,neg,_mm512_setzero_si512(),v3));
+        __m512i wv=_mm512_permutexvar_epi64(widx,_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1));
+        a0=_mm512_dpbusd_epi32(a0,wv,_mm512_loadu_si512((const void*)(x0+i)));
+        a1=_mm512_dpbusd_epi32(a1,wv,_mm512_loadu_si512((const void*)(x1+i)));
+        a2=_mm512_dpbusd_epi32(a2,wv,_mm512_loadu_si512((const void*)(x2+i)));
+        a3=_mm512_dpbusd_epi32(a3,wv,_mm512_loadu_si512((const void*)(x3+i)));
     }
     out[0]=_mm512_reduce_add_epi32(a0); out[1]=_mm512_reduce_add_epi32(a1);
     out[2]=_mm512_reduce_add_epi32(a2); out[3]=_mm512_reduce_add_epi32(a3);
 #elif defined(__AVXVNNI__) && defined(__AVX2__)
-    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    const __m128i m4=_mm_set1_epi8(0x0F);
     __m128i a0=_mm_setzero_si128(),a1=a0,a2=a0,a3=a0;
     for(;i+32<=I;i+=32){
         __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i w0=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8), w1=_mm_sub_epi8(_mm_unpackhi_epi8(lo,hi),b8);
-        __m128i wa0=_mm_abs_epi8(w0), wa1=_mm_abs_epi8(w1);
-        a0=_mm_dpbusd_epi32(a0,wa0,_mm_sign_epi8(_mm_loadu_si128((const __m128i*)(x0+i)),w0));
-        a0=_mm_dpbusd_epi32(a0,wa1,_mm_sign_epi8(_mm_loadu_si128((const __m128i*)(x0+i+16)),w1));
-        a1=_mm_dpbusd_epi32(a1,wa0,_mm_sign_epi8(_mm_loadu_si128((const __m128i*)(x1+i)),w0));
-        a1=_mm_dpbusd_epi32(a1,wa1,_mm_sign_epi8(_mm_loadu_si128((const __m128i*)(x1+i+16)),w1));
-        a2=_mm_dpbusd_epi32(a2,wa0,_mm_sign_epi8(_mm_loadu_si128((const __m128i*)(x2+i)),w0));
-        a2=_mm_dpbusd_epi32(a2,wa1,_mm_sign_epi8(_mm_loadu_si128((const __m128i*)(x2+i+16)),w1));
-        a3=_mm_dpbusd_epi32(a3,wa0,_mm_sign_epi8(_mm_loadu_si128((const __m128i*)(x3+i)),w0));
-        a3=_mm_dpbusd_epi32(a3,wa1,_mm_sign_epi8(_mm_loadu_si128((const __m128i*)(x3+i+16)),w1));
+        __m128i w0=_mm_unpacklo_epi8(lo,hi), w1=_mm_unpackhi_epi8(lo,hi);
+        a0=_mm_dpbusd_epi32(a0,w0,_mm_loadu_si128((const __m128i*)(x0+i)));
+        a0=_mm_dpbusd_epi32(a0,w1,_mm_loadu_si128((const __m128i*)(x0+i+16)));
+        a1=_mm_dpbusd_epi32(a1,w0,_mm_loadu_si128((const __m128i*)(x1+i)));
+        a1=_mm_dpbusd_epi32(a1,w1,_mm_loadu_si128((const __m128i*)(x1+i+16)));
+        a2=_mm_dpbusd_epi32(a2,w0,_mm_loadu_si128((const __m128i*)(x2+i)));
+        a2=_mm_dpbusd_epi32(a2,w1,_mm_loadu_si128((const __m128i*)(x2+i+16)));
+        a3=_mm_dpbusd_epi32(a3,w0,_mm_loadu_si128((const __m128i*)(x3+i)));
+        a3=_mm_dpbusd_epi32(a3,w1,_mm_loadu_si128((const __m128i*)(x3+i+16)));
     }
     out[0]=hsum128_i32(a0); out[1]=hsum128_i32(a1); out[2]=hsum128_i32(a2); out[3]=hsum128_i32(a3);
 #elif defined(__AVX2__)
-    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
+    const __m128i m4=_mm_set1_epi8(0x0F);
     const __m256i ones=_mm256_set1_epi16(1);
     __m256i a0=_mm256_setzero_si256(),a1=a0,a2=a0,a3=a0;
     for(;i+32<=I;i+=32){
         __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);
-        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
-        __m256i wa=_mm256_sign_epi8(wv,wv);
-        a0=_mm256_add_epi32(a0,_mm256_madd_epi16(_mm256_maddubs_epi16(wa,
-            _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(x0+i)),wv)),ones));
-        a1=_mm256_add_epi32(a1,_mm256_madd_epi16(_mm256_maddubs_epi16(wa,
-            _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(x1+i)),wv)),ones));
-        a2=_mm256_add_epi32(a2,_mm256_madd_epi16(_mm256_maddubs_epi16(wa,
-            _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(x2+i)),wv)),ones));
-        a3=_mm256_add_epi32(a3,_mm256_madd_epi16(_mm256_maddubs_epi16(wa,
-            _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(x3+i)),wv)),ones));
+        __m256i wv=_mm256_set_m128i(_mm_unpackhi_epi8(lo,hi),_mm_unpacklo_epi8(lo,hi));
+        a0=_mm256_add_epi32(a0,_mm256_madd_epi16(_mm256_maddubs_epi16(wv,
+            _mm256_loadu_si256((const __m256i*)(x0+i))),ones));
+        a1=_mm256_add_epi32(a1,_mm256_madd_epi16(_mm256_maddubs_epi16(wv,
+            _mm256_loadu_si256((const __m256i*)(x1+i))),ones));
+        a2=_mm256_add_epi32(a2,_mm256_madd_epi16(_mm256_maddubs_epi16(wv,
+            _mm256_loadu_si256((const __m256i*)(x2+i))),ones));
+        a3=_mm256_add_epi32(a3,_mm256_madd_epi16(_mm256_maddubs_epi16(wv,
+            _mm256_loadu_si256((const __m256i*)(x3+i))),ones));
     }
     out[0]=hsum256_i32(a0); out[1]=hsum256_i32(a1); out[2]=hsum256_i32(a2); out[3]=hsum256_i32(a3);
 #else
-    out[0]=dot_i4i8(w4,x0,I); out[1]=dot_i4i8(w4,x1,I);
-    out[2]=dot_i4i8(w4,x2,I); out[3]=dot_i4i8(w4,x3,I);
+    out[0]=dot_i4i8u(w4,x0,I); out[1]=dot_i4i8u(w4,x1,I);
+    out[2]=dot_i4i8u(w4,x2,I); out[3]=dot_i4i8u(w4,x3,I);
     return;
 #endif
-    for(;i<I;i++){ uint8_t b=w4[i>>1]; int wi=(i&1)?((int)(b>>4)-8):((int)(b&0xF)-8);
+    for(;i<I;i++){ uint8_t b=w4[i>>1]; int wi=(i&1)?(int)(b>>4):(int)(b&0xF);
         out[0]+=wi*x0[i]; out[1]+=wi*x1[i]; out[2]+=wi*x2[i]; out[3]+=wi*x3[i]; }
 }
+/* signed sum of an int8 activation row — the offset-form correction term.
+ * maddubs(1,x) pairwise-adds signed bytes (|pair| <= 254, no saturation). */
+static inline int32_t rowsum_i8(const int8_t *x, int I){
+    int32_t s=0; int i=0;
+#ifdef __AVX2__
+    const __m256i one8=_mm256_set1_epi8(1), one16=_mm256_set1_epi16(1);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32)
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(_mm256_maddubs_epi16(one8,
+            _mm256_loadu_si256((const __m256i*)(x+i))),one16));
+    s=hsum256_i32(acc);
+#endif
+    for(;i<I;i++) s+=x[i];
+    return s;
+}
+static _Thread_local struct { int32_t *p; size_t cap; } g_xsum;
+static int32_t *xsum_scratch(size_t n){
+    if(n>g_xsum.cap){ int32_t *p=realloc(g_xsum.p,n*sizeof(int32_t));
+        if(!p){fprintf(stderr,"OOM xsum scratch\n");exit(1);} g_xsum.p=p; g_xsum.cap=n; }
+    return g_xsum.p;
+}
+
+/* dot int2(packed)·int8, raw-offset form: container stores w+2 in [0,3], 4/byte
+ * (elem i in bits (i&3)*2). Caller subtracts 2*rowsum(x). The 4-way bit unpack is
+ * restored to memory order with an epi8+epi16 unpack tree; values <= 3 so every
+ * maddubs pair is <= 3*127*2 — far from saturation. AVX2 covers AVX-512 builds
+ * too (no int2 weights ship today; widen when the compression track lands). */
+static inline int32_t dot_i2i8u(const uint8_t *w2, const int8_t *x, int I){
+    int32_t sum=0; int i=0;
+#ifdef __AVX2__
+    const __m128i m2=_mm_set1_epi8(0x03);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+64<=I;i+=64){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w2+(i>>2)));   /* 16 bytes = 64 values */
+        __m128i l0=_mm_and_si128(by,m2),                    l1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
+        __m128i l2=_mm_and_si128(_mm_srli_epi16(by,4),m2), l3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
+        __m128i u01l=_mm_unpacklo_epi8(l0,l1), u23l=_mm_unpacklo_epi8(l2,l3);
+        __m128i u01h=_mm_unpackhi_epi8(l0,l1), u23h=_mm_unpackhi_epi8(l2,l3);
+        __m256i w01=_mm256_set_m128i(_mm_unpackhi_epi16(u01l,u23l),_mm_unpacklo_epi16(u01l,u23l));
+        __m256i w23=_mm256_set_m128i(_mm_unpackhi_epi16(u01h,u23h),_mm_unpacklo_epi16(u01h,u23h));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(_mm256_maddubs_epi16(w01,
+            _mm256_loadu_si256((const __m256i*)(x+i))),ones));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(_mm256_maddubs_epi16(w23,
+            _mm256_loadu_si256((const __m256i*)(x+i+32))),ones));
+    }
+    sum=hsum256_i32(acc);
+#endif
+    for(;i<I;i++){ uint8_t b=w2[i>>2]; sum+=(int)((b>>((i&3)*2))&3)*x[i]; }
+    return sum;
+}
+static inline void dotrow_i2i8u_x4(const uint8_t *w2, const int8_t *xq, int I, int32_t *out){
+    const int8_t *xr[4]={xq,xq+(int64_t)I,xq+2*(int64_t)I,xq+3*(int64_t)I};
+    int i=0;
+#ifdef __AVX2__
+    const __m128i m2=_mm_set1_epi8(0x03);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i a[4]; a[0]=a[1]=a[2]=a[3]=_mm256_setzero_si256();
+    for(;i+64<=I;i+=64){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w2+(i>>2)));
+        __m128i l0=_mm_and_si128(by,m2),                    l1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
+        __m128i l2=_mm_and_si128(_mm_srli_epi16(by,4),m2), l3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
+        __m128i u01l=_mm_unpacklo_epi8(l0,l1), u23l=_mm_unpacklo_epi8(l2,l3);
+        __m128i u01h=_mm_unpackhi_epi8(l0,l1), u23h=_mm_unpackhi_epi8(l2,l3);
+        __m256i w01=_mm256_set_m128i(_mm_unpackhi_epi16(u01l,u23l),_mm_unpacklo_epi16(u01l,u23l));
+        __m256i w23=_mm256_set_m128i(_mm_unpackhi_epi16(u01h,u23h),_mm_unpacklo_epi16(u01h,u23h));
+        for(int k=0;k<4;k++){
+            a[k]=_mm256_add_epi32(a[k],_mm256_madd_epi16(_mm256_maddubs_epi16(w01,
+                _mm256_loadu_si256((const __m256i*)(xr[k]+i))),ones));
+            a[k]=_mm256_add_epi32(a[k],_mm256_madd_epi16(_mm256_maddubs_epi16(w23,
+                _mm256_loadu_si256((const __m256i*)(xr[k]+i+32))),ones));
+        }
+    }
+    for(int k=0;k<4;k++) out[k]=hsum256_i32(a[k]);
+#else
+    for(int k=0;k<4;k++) out[k]=dot_i2i8u(w2,xr[k],I);
+    return;
+#endif
+    for(;i<I;i++){ uint8_t b=w2[i>>2]; int wi=(int)((b>>((i&3)*2))&3);
+        for(int k=0;k<4;k++) out[k]+=wi*xr[k][i]; }
+}
+
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
     #pragma omp parallel for schedule(static)
@@ -695,15 +761,33 @@ static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int
             for(int k=0;k<4;k++) y[(int64_t)(s+k)*O+o]=(float)d[k]*sc*sx[s+k]; }
         for(;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
+/* int4/int2 idot matmuls, offset form: kernels dot RAW offset weights; the signed
+ * result is recovered per element as raw - offset*rowsum(x) — exact in integers,
+ * so results are bit-identical to the signed-kernel form. rowsum costs one pass
+ * per activation row, amortized over all O weight rows. */
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
+    int32_t *xs=xsum_scratch((size_t)S);
+    for(int s=0;s<S;s++) xs[s]=8*rowsum_i8(xq+(int64_t)s*I,I);
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o]; int s=0;
         for(;s+4<=S;s+=4){ int32_t d[4];
-            dotrow_i4i8_x4(w,xq+(int64_t)s*I,I,d);
-            for(int k=0;k<4;k++) y[(int64_t)(s+k)*O+o]=(float)d[k]*sc*sx[s+k]; }
-        for(;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+            dotrow_i4i8u_x4(w,xq+(int64_t)s*I,I,d);
+            for(int k=0;k<4;k++) y[(int64_t)(s+k)*O+o]=(float)(d[k]-xs[s+k])*sc*sx[s+k]; }
+        for(;s<S;s++) y[(int64_t)s*O+o]=(float)(dot_i4i8u(w,xq+(int64_t)s*I,I)-xs[s])*sc*sx[s]; }
+}
+static void matmul_i2_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q2,
+                           const float *scale, int S, int I, int O){
+    int rb=(I+3)/4;
+    int32_t *xs=xsum_scratch((size_t)S);
+    for(int s=0;s<S;s++) xs[s]=2*rowsum_i8(xq+(int64_t)s*I,I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){ const uint8_t *w=q2+(int64_t)o*rb; float sc=scale[o]; int s=0;
+        for(;s+4<=S;s+=4){ int32_t d[4];
+            dotrow_i2i8u_x4(w,xq+(int64_t)s*I,I,d);
+            for(int k=0;k<4;k++) y[(int64_t)(s+k)*O+o]=(float)(d[k]-xs[s+k])*sc*sx[s+k]; }
+        for(;s<S;s++) y[(int64_t)s*O+o]=(float)(dot_i2i8u(w,xq+(int64_t)s*I,I)-xs[s])*sc*sx[s]; }
 }
 
 typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch;
@@ -728,11 +812,12 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
-    if(g_idot&&(w->fmt==1||(w->fmt==2&&S>=g_i4s))){
+    if(g_idot&&(w->fmt==1||((w->fmt==2||w->fmt==3)&&S>=g_i4s))){
         int I=w->I; int8_t *xq; float *sx;
         quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I,xq+(int64_t)s*I,I);
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
+        else if(w->fmt==3) matmul_i2_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         return;
     }
