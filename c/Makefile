@@ -96,7 +96,7 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_idot_hy3$(EXE) tests/test_i4_acc512$(EXE)
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -136,8 +136,10 @@ endif
 
 all: glm$(EXE) hy3$(EXE)
 
-# phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
+# phony 'glm'/'hy3' → 'glm.exe'/'hy3.exe' on Windows (so 'make glm'/'make hy3' and 'coli build' work on every platform)
 glm: glm$(EXE)
+
+hy3: hy3$(EXE)
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
@@ -208,6 +210,9 @@ tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_idot_hy3$(EXE): tests/test_idot_hy3.c hy3.c st.h json.h tok.h tok_unicode.h compat.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c

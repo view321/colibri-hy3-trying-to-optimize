@@ -26,6 +26,9 @@
 #if defined(__linux__) && defined(COLI_IOURING)
 #include <liburing.h>
 #endif
+#ifdef __linux__
+#include <sys/syscall.h>   /* set_mempolicy: NUMA page interleave (numa_interleave) */
+#endif
 #include "st.h"
 #include "json.h"
 #include "compat.h"
@@ -348,7 +351,30 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
-static int g_idot=1, g_i4s=2, g_nopack=0, g_drop=0, g_direct=0;
+/* ---- INTEGER (IDOT) KERNELS: activations quantized to int8 per row (absmax/127,
+ * Q8_0-style), dot product kept in integer SIMD — no f32 weight conversion in the
+ * hot loop. ~2-3x on quantized matmuls; added error ~0.3% RMS per matmul; IDOT=0
+ * falls back to the exact f32 path. Verbatim port of glm.c's kernels (exactness
+ * vs plain C enforced by tests/test_idot_hy3.c). hy3's previous AVX2 dot_i8i8
+ * used sign(x,x) — computing sum(|w|*|x|), not sum(w*x) — which is why IDOT had
+ * to ship disabled here while glm ran it by default. */
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#define IDOT_KERNEL "avx512-vnni"
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+#define IDOT_KERNEL "avx-vnni"
+#elif defined(__AVX2__)
+#define IDOT_KERNEL "avx2"
+#elif defined(__ARM_NEON)
+#define IDOT_KERNEL "neon"
+#else
+#define IDOT_KERNEL "scalar"
+#endif
+static int g_idot=1, g_nopack=0, g_drop=0, g_direct=0;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static int g_i4s=1;   /* SDOT: int4 IDOT pays even at S=1 (measured on M-series, see glm.c) */
+#else
+static int g_i4s=2;   /* x86: f32 AVX2 path wins at S=1 (glm's measurement); I4S=1 to re-tune */
+#endif
 static int g_perf=0, g_kv_i8=0, g_tree_draft=0;
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
@@ -362,21 +388,51 @@ static inline int hsum256_i32(__m256i v){
     return _mm_cvtsi128_si32(lo);
 }
 #endif
+#if defined(__AVXVNNI__) && defined(__AVX2__)
+/* hsum of a 4-lane s32 __m128i (128-bit AVX-VNNI accumulates over 4 lanes). */
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
+}
+#endif
+/* dot int8·int8: sign trick (|w| unsigned × x·sign(w) signed). Safe: pairs
+ * <= 128*127*2 = 32512 < 32767, s32 accumulation up to I=16384. */
 static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
-    int32_t sum=0;
-#ifdef __AVX2__
+    int32_t sum=0; int i=0;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* VNNI: vpdpbusd u8*s8 -> s32 directly, 64 bytes/iter, no 16-bit intermediate.
+     * AVX-512 has no vpsignb: |w| via abs, sign folded into x with a mask-negate
+     * (w==0 -> product 0 either way). |x|<=127 (qrow_i8), |w|<=128 as u8: each
+     * s32 lane adds <= 4*128*127, safe up to I=16384 like the AVX2 bound. */
+    __m512i acc=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m512i wv=_mm512_loadu_si512((const void*)(w+i));
+        __m512i xv=_mm512_loadu_si512((const void*)(x+i));
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
+        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+    }
+    sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* AVX-VNNI 128-bit: vpdpbusd u8*s8 -> s32, 16 bytes/iter, same sign trick. */
+    __m128i acc=_mm_setzero_si128();
+    for(;i+16<=I;i+=16){
+        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i xs=_mm_sign_epi8(xv,wv);              /* x * sign(w) */
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),xs);
+    }
+    sum=hsum128_i32(acc);
+#elif defined(__AVX2__)
     __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
-    int i=0;
     for(;i+32<=I;i+=32){
         __m256i wv=_mm256_loadu_si256((const __m256i*)(w+i));
         __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
-        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,xv));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
-    for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
 #elif defined(__ARM_NEON)
-    int32x4_t acc=vdupq_n_s32(0); int i=0;
+    int32x4_t acc=vdupq_n_s32(0);
     for(;i+16<=I;i+=16){
         int8x16_t wv=vld1q_s8(w+i), xv=vld1q_s8(x+i);
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -388,16 +444,88 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
 #endif
     }
     sum=vaddvq_s32(acc);
-    for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
-#else
-    for(int i=0;i<I;i++) sum+=(int32_t)w[i]*x[i];
 #endif
+    for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
     return sum;
 }
+/* dot int4(packed)·int8: nibble -> int8 [-8,7] on the fly, then same sign trick */
 static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
-    int32_t sum=0;
-    for(int i=0;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
-    if(I&1){ uint8_t b=w4[I>>1]; sum+=((int)(b&0xF)-8)*x[I-1]; }
+    int32_t sum=0; int i=0;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* 32 bytes = 64 nibbles -> int8 in [-8,7], one vpdpbusd per 64 values.
+     * 256-bit unpack leaves values in per-128-lane order [0-15][32-47]/[16-31][48-63];
+     * dot pairing is order-invariant, so permute x's 128-bit blocks to match
+     * instead of re-ordering w (one vpermq per iter, off the critical unpack path). */
+    const __m256i m4v=_mm256_set1_epi8(0x0F);
+    const __m512i b8v=_mm512_set1_epi8(8);
+    const __m512i xidx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
+    __m512i acc=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m256i by=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
+        __m256i lo=_mm256_and_si256(by,m4v), hi=_mm256_and_si256(_mm256_srli_epi16(by,4),m4v);
+        __m256i z0=_mm256_unpacklo_epi8(lo,hi), z1=_mm256_unpackhi_epi8(lo,hi);
+        __m512i wv=_mm512_sub_epi8(_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1),b8v);
+        __m512i xv=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x+i)));
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
+        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+    }
+    sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* AVX-VNNI 128-bit, int4: 16 bytes = 32 nibbles -> int8 [-8,7] in two halves
+     * (n0/n1), each fed to a 16-byte vpdpbusd. Same 128-bit unpack as the AVX2
+     * branch below; 32 elements/iter. */
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    __m128i acc=_mm_setzero_si128();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 bytes = 32 nibbles */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);  /* in order */
+        __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+    }
+    sum=hsum128_i32(acc);
+#elif defined(__AVX2__)
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 bytes = 32 nibbles */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);   /* in order */
+        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
+        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
+    }
+    sum=hsum256_i32(acc);
+#elif defined(__ARM_NEON)
+    const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+    int32x4_t acc=vdupq_n_s32(0);
+    for(;i+32<=I;i+=32){
+        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 bytes = 32 nibbles */
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibbles in order */
+        int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
+        int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
+        int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
+#if defined(__ARM_FEATURE_DOTPROD)
+        acc=vdotq_s32(acc,w0,x0); acc=vdotq_s32(acc,w1,x1);
+#else
+        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: no overflow */
+        p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
+        acc=vpadalq_s16(acc,p);
+        p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
+        p=vmlal_s8(p,vget_high_s8(w1),vget_high_s8(x1));
+        acc=vpadalq_s16(acc,p);
+#endif
+    }
+    sum=vaddvq_s32(acc);
+#endif
+    for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
+    if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
     return sum;
 }
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
@@ -2398,12 +2526,35 @@ static void run_prompt_ids(Model *m, int ngen){
     free(prompt); free(out);
 }
 
+#ifdef __linux__
+/* Multi-socket / multi-die NUMA boxes: by default the first thread to touch a page
+ * owns it, so dense weights land on the boot thread's node and pinned experts on
+ * whichever pin_load worker faulted them — then matmul threads on the other node(s)
+ * cross the fabric for ~half their reads. Page interleave (the in-process version of
+ * `numactl --interleave=all`, no libnuma dependency) gives every thread uniform
+ * average bandwidth. No-op with a single memory node (laptops, most VMs); NUMA=0
+ * disables. */
+static void numa_interleave(void){
+    unsigned long mask[16]={0}; int dummy=0;                            /* up to 1024 nodes */
+    if(syscall(SYS_get_mempolicy,&dummy,mask,1024UL,NULL,4UL)) return;  /* 4 = MPOL_F_MEMS_ALLOWED */
+    int n=0; for(int i=0;i<1024;i++) n+=(int)((mask[i>>6]>>(i&63))&1UL);
+    if(n<2) return;
+    if(getenv("NUMA")&&!atoi(getenv("NUMA"))){
+        fprintf(stderr,"[NUMA] %d memory nodes, interleave disabled (NUMA=0)\n",n); return; }
+    if(!syscall(SYS_set_mempolicy,3UL,mask,1024UL))                     /* 3 = MPOL_INTERLEAVE */
+        fprintf(stderr,"[NUMA] %d memory nodes: page interleave enabled (NUMA=0 to disable)\n",n);
+}
+#else
+static void numa_interleave(void){}
+#endif
+
 int main(int argc, char **argv){
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    numa_interleave();
     g_nopack=getenv("NOPACK")?1:0;
     g_drop=getenv("DROP")?1:0;
     g_direct=getenv("DIRECT")?atoi(getenv("DIRECT")):0;
-    g_idot=getenv("IDOT")?atoi(getenv("IDOT")):0;  /* IDOT=1 breaks int4/int8 on Hy3 until validated */
+    g_idot=getenv("IDOT")?atoi(getenv("IDOT")):1;  /* int8-activation integer kernels; IDOT=0 = exact f32 path */
     g_i4s=getenv("I4S")?atoi(getenv("I4S")):g_i4s;
     g_pipe=getenv("PIPE")?atoi(getenv("PIPE")):0;
     if(g_pipe==2){
@@ -2461,7 +2612,8 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
-    printf("== Hy3 C engine, cache=%d experts/layer | experts@%d-bit dense@%d-bit ==\n",cap,ebits,dbits);
+    printf("== Hy3 C engine, cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: %s ==\n",
+        cap,ebits,dbits,g_idot?IDOT_KERNEL:"off");
     g_mem_avail_boot=mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0) g_draft=m.has_mtp?3:0;

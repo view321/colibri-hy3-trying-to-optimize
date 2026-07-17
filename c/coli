@@ -242,8 +242,8 @@ def apply_accel_env(e, a, engine):
 def env_for(a):
     e = dict(os.environ, SNAP=a.model)
     e["COLI_POLICY"]=a.policy
-    if engine_for(a.model) == HY3 and "IDOT" not in e:
-        e["IDOT"] = "0"  # Hy3 int8/int4 IDOT path not yet oracle-clean
+    # Hy3 IDOT is on by default since the dot_i8i8 sign fix (tests/test_idot_hy3.c);
+    # IDOT=0 in the environment still selects the exact f32 path.
     if a.ram:  e["RAM_GB"]=str(a.ram)
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
