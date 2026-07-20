@@ -102,7 +102,7 @@ static void tok_load(Tok *T, const char *path){
     /* id massimo per dimensionare id2str */
     int maxid=0;
     for(int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>maxid)maxid=id; }
-    if(added) for(int i=0;i<added->len;i++){ int id=(int)json_get(added->kids[i],"id")->num; if(id>maxid)maxid=id; }
+    if(added) for(int i=0;i<added->len;i++){ jval *idv=json_get(added->kids[i],"id"); if(idv&&(int)idv->num>maxid)maxid=(int)idv->num; }
     T->n_ids=maxid+1;
     T->id2str=calloc(T->n_ids,sizeof(char*));
     T->id_added=calloc(T->n_ids,sizeof(int));
@@ -120,8 +120,14 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
+        const char *l, *r; int ll, rl;
+        if(pr->t==J_ARR && pr->len>=2 && pr->kids[0]->str && pr->kids[1]->str){
+            l=pr->kids[0]->str; r=pr->kids[1]->str;            /* new format: ["left","right"] */
+            ll=(int)strlen(l); rl=(int)strlen(r);
+        } else if(pr->t==J_STR && pr->str){
+            char *sp=strchr(pr->str,' '); if(!sp) continue;    /* old format: "left right" */
+            l=pr->str; ll=(int)(sp-pr->str); r=sp+1; rl=(int)strlen(r);
+        } else continue;
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
@@ -130,9 +136,11 @@ static void tok_load(Tok *T, const char *path){
         T->nsp=added->len; T->sp=calloc(T->nsp,sizeof(Special));
         for(int i=0;i<added->len;i++){
             jval *a=added->kids[i];
-            char *content=json_get(a,"content")->str; int id=(int)json_get(a,"id")->num;
+            jval *cv=json_get(a,"content"), *idv=json_get(a,"id");
+            if(!cv||!cv->str||!idv) continue;
+            char *content=cv->str; int id=(int)idv->num;
             T->sp[i].str=content; T->sp[i].len=(int)strlen(content); T->sp[i].id=id;
-            T->id2str[id]=content; T->id_added[id]=1;
+            if(id>=0 && id<T->n_ids){ T->id2str[id]=content; T->id_added[id]=1; }
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
     }
