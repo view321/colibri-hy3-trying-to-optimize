@@ -182,6 +182,7 @@ typedef struct {
     float **Kscale, **Vscale;
     int *kv_start;                               /* prima pos valida nella KV (MTP: parziale) */
     float **recur_state, **conv_state;           /* gated-deltanet per-layer state; NULL for full-attn layers (M5) */
+    float **dn_snap_recur, **dn_snap_conv;       /* snapshot of the above for speculative-verify rollback (MTP) */
     ESlot **ecache; int *ecn; int ecap;
     ESlot **pin; int *npin;
     ESlot ws[64];
@@ -1604,6 +1605,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->L=calloc(c->n_layers,sizeof(Layer));
     m->recur_state=calloc(c->n_layers,sizeof(float*));  /* gated-deltanet state (M5); per-layer buf alloc'd lazily */
     m->conv_state =calloc(c->n_layers,sizeof(float*));
+    m->dn_snap_recur=calloc(c->n_layers,sizeof(float*));
+    m->dn_snap_conv =calloc(c->n_layers,sizeof(float*));
     int nrows=c->n_layers+1;
     m->ecap=cap; m->ecache=calloc(nrows,sizeof(ESlot*)); m->ecn=calloc(nrows,sizeof(int));
     m->pin=calloc(nrows,sizeof(ESlot*)); m->npin=calloc(nrows,sizeof(int));
@@ -1715,12 +1718,13 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             #define PM(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
             l->in_ln=ld(m,PM("input_layernorm.weight"));
             l->post_ln=ld(m,PM("post_attention_layernorm.weight"));
-            l->q=qt_load(m,PM("self_attn.q_proj.weight"),qo,D,dbits);
+            l->q=qt_load(m,PM("self_attn.q_proj.weight"),c->is_qwen36?qo*2:qo,D,dbits);
             l->k=qt_load(m,PM("self_attn.k_proj.weight"),kvo,D,dbits);
             l->v=qt_load(m,PM("self_attn.v_proj.weight"),kvo,D,dbits);
             l->o=qt_load(m,PM("self_attn.o_proj.weight"),D,qo,dbits);
             l->qn=ld(m,PM("self_attn.q_norm.weight"));
             l->kn=ld(m,PM("self_attn.k_norm.weight"));
+            l->attn_type=0;   /* Qwen MTP layer is full (gated) attention */
             l->sparse=1;
             snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.router.gate.weight",i);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight",i);
@@ -1741,6 +1745,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.down_proj.weight",i);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.down_proj.weight",i);
             l->sh_down=qt_load_first(m,nm2,nm,D,sI,dbits);
+            if(c->is_qwen36){ snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight",i);
+                l->sh_gate_w = st_has(&m->S,nm)?ld(m,nm):NULL; }
             m->eh_proj=qt_load(m,PM("eh_proj.weight"),D,2*D,dbits);
             m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
             char mtp_na[512], mtp_nb[512];
@@ -2685,6 +2691,23 @@ static void emit_stream(int t, void *ud){
     if(g_perf && e->count%100==0) perf_report(e->m);
 }
 
+/* Snapshot (save=1) / restore (save=0) the DeltaNet recurrent+conv state for
+ * speculative-verify rollback. The verify forward advances the recurrent state over
+ * ALL drafted tokens; when drafts are rejected we restore and re-run only the accepted
+ * prefix. Full-attn layers need no snapshot (KV is position-indexed). Hy3 = no-op. */
+static void dn_snapshot(Model *m, int save){
+    Cfg *c=&m->c; if(!c->is_qwen36) return;
+    int64_t rn=(int64_t)c->lin_v_heads*c->lin_k_dim*c->lin_v_dim;
+    int64_t cn=(int64_t)(2*c->lin_k_heads*c->lin_k_dim+c->lin_v_heads*c->lin_v_dim)*(c->lin_conv>1?c->lin_conv-1:1);
+    for(int l=0;l<c->n_layers;l++){
+        if(c->attn_type[l]!=1 || !m->recur_state[l]) continue;
+        if(!m->dn_snap_recur[l]){ m->dn_snap_recur[l]=falloc(rn); m->dn_snap_conv[l]=falloc(cn); }
+        float *sr=m->dn_snap_recur[l], *sc=m->dn_snap_conv[l];
+        if(save){ memcpy(sr,m->recur_state[l],rn*sizeof(float)); memcpy(sc,m->conv_state[l],cn*sizeof(float)); }
+        else    { memcpy(m->recur_state[l],sr,rn*sizeof(float)); memcpy(m->conv_state[l],sc,cn*sizeof(float)); }
+    }
+}
+
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
     kv_alloc(m,np+n_new+g_draft+2);
     for(int i=0;i<np;i++) out[i]=prompt[i];
@@ -2713,7 +2736,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             }
         }
         if(!g&&gd>0){
-            if(m->has_mtp&&g_tree_draft){
+            if(m->has_mtp&&g_tree_draft&&!c->is_qwen36){   /* tree draft not yet DeltaNet-rollback-safe */
                 int nodes[8], parent[8], tn=mtp_draft_tree(m,next,kv,nodes,parent);
                 if(tn>=4){
                     build_tree_attn_mask(m,kv,tn,parent);
@@ -2761,6 +2784,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(kv+1+g+1>m->max_t) g=m->max_t-kv-2;
         if(g<0) g=0;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
+        if(g>0) dn_snapshot(m,1);                          /* save DeltaNet state before speculative verify */
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
         int k=0;
         if(g>0&&getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
@@ -2773,6 +2797,10 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             if((eos>=0&&draft[k]==eos)||is_stop(&m->c,draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
             k++;
+        }
+        if(g>0 && k<g && m->c.is_qwen36){   /* rejected drafts: undo the DeltaNet over-advance */
+            dn_snapshot(m,0);                                  /* restore state to before verify */
+            free(step_all(m,batch,1+k,kv)); m->n_fw++;         /* re-advance over accepted [next,draft0..k-1] */
         }
         if(gsrc==2&&m->has_mtp) m->mtp_acc+=k;
         if(m->has_mtp&&k>=1) mtp_absorb(m,all+kv+1,m->h_all,k,kv);

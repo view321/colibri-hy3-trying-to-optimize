@@ -39,6 +39,17 @@ def rename_out(name):
     return SHARED_RE.sub(".mlp.shared_experts.", name)
 
 
+def remap_mtp(name, n_layers):
+    """Map the NEXTN/MTP head (mtp.*) onto the engine's MTP slots at layer n_layers."""
+    L = "model.layers.%d." % n_layers
+    name = name.replace("mtp.fc.weight", L + "eh_proj.weight")
+    name = name.replace("mtp.pre_fc_norm_embedding.weight", L + "enorm.weight")
+    name = name.replace("mtp.pre_fc_norm_hidden.weight", L + "hnorm.weight")
+    name = name.replace("mtp.norm.weight", L + "shared_head.norm.weight")
+    name = name.replace("mtp.layers.0.", L)   # the MTP decoder layer (full-attn + MoE)
+    return name
+
+
 def emit(out, name, w, bits):
     """Write w to out under name, quantized to `bits` (bits>8 or non-2D => f32)."""
     w = w.astype(np.float32)
@@ -76,10 +87,16 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
             # skip the vision tower — the engine runs text-only
             if name.startswith("model.visual") or ".visual." in name:
                 continue
-            # the real multimodal model nests the LM under model.language_model.* ;
-            # strip to model.* so the container matches the loader (no-op for the
-            # text-only tiny fixture; lm_head.weight is already top-level).
-            oname = name.replace("model.language_model.", "model.", 1)
+            # NEXTN/MTP head: keep only with --mtp, remapped onto layer n_layers
+            if name.startswith("mtp"):
+                if not keep_mtp:
+                    continue
+                oname = remap_mtp(name, n_layers)
+            else:
+                # the real multimodal model nests the LM under model.language_model.* ;
+                # strip to model.* so the container matches the loader (no-op for the
+                # text-only tiny fixture; lm_head.weight is already top-level).
+                oname = name.replace("model.language_model.", "model.", 1)
             li = layer_idx(oname)
             if li is not None and li >= 0 and li >= n_layers and not keep_mtp:
                 continue   # drops the MTP layer (index n_layers) for now
@@ -118,6 +135,7 @@ def main():
     ap.add_argument("--io-bits", type=int, default=8, help="embed/lm_head; >8 => f32")
     ap.add_argument("--xbits", type=int, default=4, help="MoE experts")
     ap.add_argument("--n-layers", type=int, default=40)
+    ap.add_argument("--mtp", action="store_true", help="include the NEXTN/MTP head for speculative decode")
     a = ap.parse_args()
 
     from safetensors.numpy import save_file
@@ -125,7 +143,7 @@ def main():
     os.makedirs(a.outdir, exist_ok=True)
     for i, sp in enumerate(shards):
         out = {}
-        convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
+        convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=a.mtp)
         save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
     for fn in ("config.json", "tokenizer.json", "tokenizer_config.json",
                "generation_config.json", "chat_template.jinja",
