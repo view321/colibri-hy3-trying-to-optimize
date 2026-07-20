@@ -154,11 +154,13 @@ typedef struct {
     QT gate_proj, up_proj, down_proj;
     float *router, *router_bias;
     QT sh_gate, sh_up, sh_down;
-    /* --- gated-deltanet weights (attn_type==1); small params kept f32. TODO(M5) --- */
-    QT dn_in_qkvz, dn_in_ba, dn_out;   /* in_proj_qkvz, in_proj_ba, out_proj */
-    float *dn_conv;                     /* depthwise causal conv1d [conv_dim, kernel] */
+    /* --- gated-deltanet weights (attn_type==1). qwen3_5_moe uses 4 SEPARATE
+     * projections (in_proj_qkv|z|b|a), not fused qkvz/ba. --- */
+    QT dn_in_qkv, dn_in_z, dn_in_b, dn_in_a, dn_out;
+    float *dn_conv;                     /* depthwise causal conv1d [conv_dim,1,kernel] */
     float *dn_A_log, *dn_dt_bias;       /* per-v-head decay params */
-    float *dn_norm;                     /* RMSNormGated weight [value_dim] */
+    float *dn_norm;                     /* RMSNormGated weight [v_head_dim] */
+    float *sh_gate_w;                   /* shared_expert_gate [1,D] sigmoid gate; NULL if absent */
 } Layer;
 
 typedef struct {
@@ -983,13 +985,19 @@ static void qt_fill(QT *t, const float *w, int bits){
     else pack_int4(w,t->q4,t->s,t->O,t->I,bits);
 }
 
+static int g_qwen_norm1=0;   /* qwen3_5_moe standard RMSNorm: x*r*(1+weight) (zero-centered);
+                              * NOT the gated linear_attn.norm (plain weight, applied inline). */
 static void rmsnorm(float *out, const float *x, const float *w, int D, float eps){
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
-    float r=1.f/sqrtf((float)(ms/D)+eps); for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
+    float r=1.f/sqrtf((float)(ms/D)+eps);
+    if(g_qwen_norm1) for(int i=0;i<D;i++) out[i]=x[i]*r*(1.f+w[i]);
+    else             for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
 static void rmsnorm_head(float *out, const float *x, const float *w, int hd, float eps){
     double ms=0; for(int i=0;i<hd;i++) ms+=(double)x[i]*x[i];
-    float r=1.f/sqrtf((float)(ms/hd)+eps); for(int i=0;i<hd;i++) out[i]=x[i]*r*w[i];
+    float r=1.f/sqrtf((float)(ms/hd)+eps);
+    if(g_qwen_norm1) for(int i=0;i<hd;i++) out[i]=x[i]*r*(1.f+w[i]);
+    else             for(int i=0;i<hd;i++) out[i]=x[i]*r*w[i];
 }
 static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i]>m)m=x[i];
     float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++) x[i]/=s; }
@@ -1113,6 +1121,7 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *mt=json_get(top,"model_type"); if(!mt) mt=json_get(r,"model_type");
     c->is_qwen36=(mt&&mt->t==J_STR&&strncmp(mt->str,"qwen3_5",7)==0);
     g_qwen_dbg=getenv("QWEN_DEBUG")?atoi(getenv("QWEN_DEBUG")):0;
+    g_qwen_norm1=c->is_qwen36;   /* qwen standard RMSNorms use x*r*(1+weight) */
     c->full_attn_interval=gi(r,"full_attention_interval");
     c->lin_k_heads=gi(r,"linear_num_key_heads"); c->lin_k_dim=gi(r,"linear_key_head_dim");
     c->lin_v_heads=gi(r,"linear_num_value_heads"); c->lin_v_dim=gi(r,"linear_value_head_dim");
@@ -1193,7 +1202,9 @@ static int st_has_any(Model *m, const char *a, const char *b){
 
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
-    if(e->fmt==0){ memcpy(x,e->qf+(int64_t)tok*D,D*sizeof(float)); return; }
+    if(e->fmt==0){ memcpy(x,e->qf+(int64_t)tok*D,D*sizeof(float));
+        if(g_qwen_dbg){ static int o=1; if(o){o=0; fprintf(stderr,"[qwen] embed tok=%d fmt=%d x0=%.5f x1=%.5f x2=%.5f\n",tok,e->fmt,x[0],x[1],x[2]); } }
+        return; }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
     if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];
@@ -1617,15 +1628,17 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->kn=ld(m,P("self_attn.k_norm.weight"));
         } else {                             /* gated-deltanet (Qwen3.6 linear layers) */
             int kd=c->lin_k_heads*c->lin_k_dim, vd=c->lin_v_heads*c->lin_v_dim;
-            int qkvz=2*kd+2*vd, ba=2*c->lin_v_heads;
-            l->dn_in_qkvz=qt_load(m,P("linear_attn.in_proj_qkvz.weight"),qkvz,D,dbits);
-            l->dn_in_ba  =qt_load(m,P("linear_attn.in_proj_ba.weight"),ba,D,dbits);
-            l->dn_out    =qt_load(m,P("linear_attn.out_proj.weight"),D,vd,dbits);
-            l->dn_conv   =ld(m,P("linear_attn.conv1d.weight"));   /* [conv_dim,1,kernel] */
-            l->dn_A_log  =ld(m,P("linear_attn.A_log"));
+            int convd=2*kd+vd, vhh=c->lin_v_heads;
+            l->dn_in_qkv=qt_load(m,P("linear_attn.in_proj_qkv.weight"),convd,D,dbits);
+            l->dn_in_z  =qt_load(m,P("linear_attn.in_proj_z.weight"),vd,D,dbits);
+            l->dn_in_b  =qt_load(m,P("linear_attn.in_proj_b.weight"),vhh,D,dbits);
+            l->dn_in_a  =qt_load(m,P("linear_attn.in_proj_a.weight"),vhh,D,dbits);
+            l->dn_out   =qt_load(m,P("linear_attn.out_proj.weight"),D,vd,dbits);
+            l->dn_conv  =ld(m,P("linear_attn.conv1d.weight"));   /* [conv_dim,1,kernel] */
+            l->dn_A_log =ld(m,P("linear_attn.A_log"));
             l->dn_dt_bias=ld(m,P("linear_attn.dt_bias"));
-            l->dn_norm   =ld(m,P("linear_attn.norm.weight"));
-            QDBG("load L%d deltanet: kd=%d vd=%d qkvz=%d ba=%d conv_k=%d\n",i,kd,vd,qkvz,ba,c->lin_conv);
+            l->dn_norm  =ld(m,P("linear_attn.norm.weight"));
+            QDBG("load L%d deltanet: kd=%d vd=%d convd=%d vh=%d conv_k=%d\n",i,kd,vd,convd,vhh,c->lin_conv);
         }
         l->sparse=(i>=c->first_dense);
         if(!l->sparse){
@@ -1652,6 +1665,10 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.down_proj.weight",i);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.down_proj.weight",i);
             l->sh_down=qt_load_first(m,nm2,nm,D,sI,dbits);
+            if(c->is_qwen36){   /* qwen3_5_moe: shared expert has a sigmoid gate [1,D] */
+                snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight",i);
+                l->sh_gate_w = st_has(&m->S,nm) ? ld(m,nm) : NULL;
+            }
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
@@ -1967,7 +1984,7 @@ static void attention_qwen(Model *m, Layer *l, int layer, float *x, int S, int p
     for(int64_t i=0;i<qsz;i++) ctx[i]*=1.0f/(1.0f+expf(-G[i]));   /* sigmoid output gate */
     matmul_qt(out,ctx,&l->o,S);
     m->t_attn+=now_s()-ta0;
-    QDBG("full L%d: rot=%d S=%d q0=%.4f g0=%.4f out0=%.4f\n",layer,rot,S,Q[0],G[0],out[0]);
+    QDBG("full L%d: rot=%d S=%d xin=%.4f Q2_0=%.4f q0=%.4f g0=%.4f out0=%.4f\n",layer,rot,S,x[0],Q2[0],Q[0],G[0],out[0]);
     free(Q2); free(Q); free(G); free(Kp); free(Vp); free(ctx);
 }
 
@@ -2319,12 +2336,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int 
      * on-device SiLU) — 2 PCIe crossings instead of 6 matmul round-trips plus a
      * CPU SiLU. Falls back to the CPU path on any upload/dispatch failure. */
     int shared_done=0;
+    float *shg=NULL;   /* qwen3_5_moe shared_expert_gate: per-token sigmoid(x·w_gate) */
+    if(c->is_qwen36 && l->sh_gate_w){
+        shg=falloc(S);
+        for(int s=0;s<S;s++){ const float *xs=x+(int64_t)s*D; float dd=0;
+            for(int e=0;e<D;e++) dd+=xs[e]*l->sh_gate_w[e]; shg[s]=1.f/(1.f+expf(-dd)); }
+    }
 #ifdef COLI_CUDA
     if(g_cuda_enabled && g_cuda_dense && l->sh_gate.cuda_eligible && l->sh_up.cuda_eligible &&
        l->sh_down.cuda_eligible && !l->sh_gate.cuda_failed && !omp_in_parallel() &&
        qt_cuda_upload(&l->sh_gate) && qt_cuda_upload(&l->sh_up) && qt_cuda_upload(&l->sh_down) &&
        coli_cuda_expert_mlp(l->sh_gate.cuda,l->sh_up.cuda,l->sh_down.cuda,hh,x,S)){
-        for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+        for(int s=0;s<S;s++){ float g=shg?shg[s]:1.f; for(int e=0;e<D;e++) out[(int64_t)s*D+e]+=g*hh[(int64_t)s*D+e]; }
         shared_done=1;
     }
 #endif
@@ -2333,9 +2356,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int 
         matmul_qt(sg,x,&l->sh_gate,S); matmul_qt(su,x,&l->sh_up,S);
         for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
         matmul_qt(hh,sg,&l->sh_down,S);
-        for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
+        for(int s=0;s<S;s++){ float g=shg?shg[s]:1.f; for(int e=0;e<D;e++) out[(int64_t)s*D+e]+=g*hh[(int64_t)s*D+e]; }
         free(sg); free(su);
     }
+    if(shg) free(shg);
     free(logit); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw);
     if(xbatch) free(xbatch); if(ybatch) free(ybatch);
@@ -2356,10 +2380,12 @@ static void gated_deltanet(Model *m, Layer *l, int layer, float *x, int S, int p
     Cfg *c=&m->c;
     int kh=c->lin_k_heads, kdim=c->lin_k_dim, vh=c->lin_v_heads, vdim=c->lin_v_dim, K=c->lin_conv;
     int kd=kh*kdim, vd=vh*vdim, convd=2*kd+vd, grp=(kh>0?vh/kh:1);
-    int qkvz=2*kd+2*vd, ba=2*vh;
+    float qscale=1.f/sqrtf((float)kdim);   /* HF scales the (l2-normed) query by 1/sqrt(k_head_dim) */
     double ta0=now_s();
-    float *PZ=falloc((int64_t)S*qkvz), *PB=falloc((int64_t)S*ba);
-    matmul_qt(PZ,x,&l->dn_in_qkvz,S); matmul_qt(PB,x,&l->dn_in_ba,S);
+    float *QKV=falloc((int64_t)S*convd), *Z=falloc((int64_t)S*vd);
+    float *Bb=falloc((int64_t)S*vh), *Aa=falloc((int64_t)S*vh);
+    matmul_qt(QKV,x,&l->dn_in_qkv,S); matmul_qt(Z,x,&l->dn_in_z,S);
+    matmul_qt(Bb,x,&l->dn_in_b,S);    matmul_qt(Aa,x,&l->dn_in_a,S);
     if(!m->recur_state[layer]) m->recur_state[layer]=falloc((int64_t)vh*kdim*vdim);
     if(!m->conv_state[layer])  m->conv_state[layer]=falloc((int64_t)convd*(K>1?K-1:1));
     float *St=m->recur_state[layer], *cst=m->conv_state[layer];
@@ -2367,12 +2393,12 @@ static void gated_deltanet(Model *m, Layer *l, int layer, float *x, int S, int p
                      memset(cst,0,(size_t)convd*(K>1?K-1:1)*sizeof(float)); }
     const float *cw=l->dn_conv;                         /* [convd,1,K] -> cw[ch*K+j] */
     float *mixed=falloc((int64_t)S*convd);
-    /* causal depthwise conv over [q,k,v] (first convd cols of qkvz) + silu */
+    /* causal depthwise conv over [q,k,v] = the in_proj_qkv output + silu */
     for(int s=0;s<S;s++) for(int ch=0;ch<convd;ch++){
         float acc=0;
         for(int j=0;j<K;j++){
             int rel=s-(K-1)+j; float xin;
-            if(rel>=0) xin=PZ[(int64_t)rel*qkvz+ch];
+            if(rel>=0) xin=QKV[(int64_t)rel*convd+ch];
             else { int hist=(K-1)+rel; xin=(K>1)?cst[(int64_t)ch*(K-1)+hist]:0.f; }
             acc+=cw[ch*K+j]*xin;
         }
@@ -2382,7 +2408,7 @@ static void gated_deltanet(Model *m, Layer *l, int layer, float *x, int S, int p
         float *ncst=falloc((int64_t)convd*(K-1));
         for(int ch=0;ch<convd;ch++) for(int t=0;t<K-1;t++){
             int rel=S-(K-1)+t; float xin;
-            if(rel>=0) xin=PZ[(int64_t)rel*qkvz+ch];
+            if(rel>=0) xin=QKV[(int64_t)rel*convd+ch];
             else { int hist=(K-1)+rel; xin=cst[(int64_t)ch*(K-1)+hist]; }
             ncst[(int64_t)ch*(K-1)+t]=xin;
         }
@@ -2391,8 +2417,7 @@ static void gated_deltanet(Model *m, Layer *l, int layer, float *x, int S, int p
     float *core=falloc((int64_t)S*vd), *kvmem=falloc(vdim), *delta=falloc(vdim);
     for(int s=0;s<S;s++){
         float *q_all=mixed+(int64_t)s*convd, *k_all=q_all+kd, *v_all=k_all+kd;
-        const float *z_all=PZ+(int64_t)s*qkvz+2*kd+vd;   /* z = 4th split of qkvz */
-        const float *bb=PB+(int64_t)s*ba, *aa=bb+vh;
+        const float *z_all=Z+(int64_t)s*vd, *bb=Bb+(int64_t)s*vh, *aa=Aa+(int64_t)s*vh;
         for(int h=0;h<kh;h++){ l2norm_vec(q_all+h*kdim,kdim,1e-6f); l2norm_vec(k_all+h*kdim,kdim,1e-6f); }
         for(int hv=0;hv<vh;hv++){
             int hk=hv/grp;
@@ -2407,17 +2432,19 @@ static void gated_deltanet(Model *m, Layer *l, int layer, float *x, int S, int p
             for(int j=0;j<kdim;j++){ float kj=kv_[j], *row=Sh+(int64_t)j*vdim; for(int d=0;d<vdim;d++) row[d]+=kj*delta[d]; }
             float *o=core+(int64_t)s*vd+hv*vdim;
             for(int d=0;d<vdim;d++) o[d]=0;
-            for(int j=0;j<kdim;j++){ float qj=qv[j], *row=Sh+(int64_t)j*vdim; for(int d=0;d<vdim;d++) o[d]+=row[d]*qj; }
-            const float *zz=z_all+hv*vdim; float var=0;   /* gated RMSNorm: gate first, then normalize */
-            for(int d=0;d<vdim;d++){ float og=o[d]*(zz[d]/(1.f+expf(-zz[d]))); o[d]=og; var+=og*og; }
+            for(int j=0;j<kdim;j++){ float qj=qv[j]*qscale, *row=Sh+(int64_t)j*vdim; for(int d=0;d<vdim;d++) o[d]+=row[d]*qj; }
+            const float *zz=z_all+hv*vdim; float var=0;   /* RMSNormGated: norm FIRST, then weight, then silu(z) gate */
+            if(g_qwen_dbg&&s==0&&hv==0&&layer==0) fprintf(stderr,"[qwen] C dn core hv0: %+.5f %+.5f %+.5f | z: %+.5f %+.5f %+.5f | dnw0=%.3f\n",o[0],o[1],o[2],zz[0],zz[1],zz[2],l->dn_norm[0]);
+            for(int d=0;d<vdim;d++) var+=o[d]*o[d];
             float inv=1.f/sqrtf(var/vdim+c->eps);
-            for(int d=0;d<vdim;d++) o[d]=o[d]*inv*l->dn_norm[d];
+            for(int d=0;d<vdim;d++) o[d]=o[d]*inv*l->dn_norm[d]*(zz[d]/(1.f+expf(-zz[d])));
+            if(g_qwen_dbg&&s==0&&hv==0&&layer==0) fprintf(stderr,"[qwen] C dn post hv0: %+.5f %+.5f %+.5f\n",o[0],o[1],o[2]);
         }
     }
     matmul_qt(out,core,&l->dn_out,S);
     m->t_attn+=now_s()-ta0;
-    QDBG("dn L%d: S=%d kh=%d vh=%d grp=%d K=%d core0=%.4f out0=%.4f\n",layer,S,kh,vh,grp,K,core[0],out[0]);
-    free(PZ);free(PB);free(mixed);free(core);free(kvmem);free(delta);
+    QDBG("dn L%d: S=%d xin=%.4f QKV0=%.4f core0=%.4f out0=%.4f\n",layer,S,x[0],QKV[0],core[0],out[0]);
+    free(QKV);free(Z);free(Bb);free(Aa);free(mixed);free(core);free(kvmem);free(delta);
 }
 
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
@@ -2426,10 +2453,12 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     if(l->attn_type==1)   gated_deltanet(m,l,li,nrm,S,pos_base,tmp);
     else if(c->is_qwen36) attention_qwen(m,l,li,nrm,S,pos_base,tmp);
     else                  attention(m,l,li,nrm,S,pos_base,tmp);
+    if(g_qwen_dbg&&(li==0||li==3)) fprintf(stderr,"[qwen] C L%d attn_out: %+.5f %+.5f %+.5f\n",li,tmp[0],tmp[1],tmp[2]);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D,x+(int64_t)s*D,l->post_ln,D,c->eps);
     if(l->sparse) moe(m,l,li,nrm,x,S,tmp);
     else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+    if(g_qwen_dbg&&(li==0||li==3)) fprintf(stderr,"[qwen] C L%d mlp_out: %+.5f %+.5f %+.5f\n",li,tmp[0],tmp[1],tmp[2]);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
 }
 
@@ -2440,6 +2469,8 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
         if(S>=8&&(i%4==0||i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n",i+1,c->n_layers,S);
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+        if(g_qwen_dbg) fprintf(stderr,"[qwen] C afterL%d pos0: %+.5f %+.5f %+.5f %+.5f %+.5f\n",
+            i,x[0],x[1],x[2],x[3],x[4]);
     }
     free(nrm); free(tmp);
 }

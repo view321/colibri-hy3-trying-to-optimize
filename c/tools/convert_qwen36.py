@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
 """Convert Qwen/Qwen3.6-35B-A3B (qwen3_5_moe, Gated-DeltaNet hybrid, bf16)
--> Colibri int4 container. Fork of convert_hy3.py. See docs/QWEN36_PORT.md.
+-> Colibri container. Fork of convert_hy3.py. See docs/QWEN36_PORT.md.
 
-Reuses convert_hy3's shard/quant/download machinery and only overrides how tensors
-are classified + renamed. Source is **bf16** (not FP8), which the shared dequant()
-already passes through to f32.
+Reconciled against the real state_dict (make_qwen36_oracle.py dump):
+  - MoE experts are FUSED/batched: mlp.experts.gate_up_proj [E,2I,D] +
+    mlp.experts.down_proj [E,D,I]. We UNFUSE into per-expert tensors the engine
+    streams: experts.{j}.gate_proj.weight [I,D], .up_proj.weight [I,D],
+    .down_proj.weight [D,I]. (gate = first I rows of gate_up, up = next I.)
+  - DeltaNet has 4 separate projections: in_proj_qkv|z|b|a (not fused qkvz/ba).
+  - shared_expert.* (renamed -> shared_experts.*) + shared_expert_gate.weight.
+  - softmax router mlp.gate.weight, no expert bias.
 
-Tensor kinds (per the HF qwen3_5_moe naming; UNVERIFIED — reconcile against the
-state_dict dump printed by make_qwen36_oracle.py before a full run):
-  full-attn layers : self_attn.{q,k,v,o}_proj.weight, self_attn.{q,k}_norm.weight
-  deltanet layers  : linear_attn.{in_proj_qkvz,in_proj_ba,out_proj}.weight,
-                     linear_attn.conv1d.weight (+bias), linear_attn.A_log,
-                     linear_attn.dt_bias, linear_attn.norm.weight
-  MoE (every layer): mlp.experts.{j}.{gate,up,down}_proj.weight, mlp.gate.weight
-                     (softmax router), mlp.shared_expert.{gate,up,down}_proj.weight,
-                     mlp.shared_expert_gate.weight
-  MTP              : layer n_layers (--mtp)
+Quantization: bits>8 (e.g. 16) writes f32 (no .qs) — the loader then keeps it f32
+at dbits=16. Use --ebits 16 --io-bits 16 --xbits 8 for a math-isolating run
+(only MoE experts quantized). Use 4/4/4 for a real int4 container.
 
 Usage:
-  python3 tools/convert_qwen36.py --indir qwen36_tiny --outdir qwen36_tiny_i4 --ebits 4
-  # real model: hf download Qwen/Qwen3.6-35B-A3B --local-dir qwen36 && \
-  #   python3 tools/convert_qwen36.py --indir qwen36 --outdir /path/qwen36_i4 --ebits 4
+  python3 tools/convert_qwen36.py --indir qwen36_tiny --outdir qwen36_tiny_c \
+      --ebits 16 --io-bits 16 --xbits 8
 """
 import argparse
+import glob
 import os
 import re
+import shutil
 import sys
 
-sys.path.insert(0, os.path.dirname(__file__))
-import convert_hy3 as base  # noqa: E402  reuse convert_shard/convert_local/dequant/quant
-from convert_fp8_to_int4 import layer_idx  # noqa: E402
+import numpy as np
 
-# Qwen uses mlp.shared_expert.* (singular); the Colibri loader convention is
-# mlp.shared_experts.* (plural), same as Hy3/GLM.
+sys.path.insert(0, os.path.dirname(__file__))
+import convert_hy3 as base  # noqa: E402  (dequant reused)
+from convert_fp8_to_int4 import quant_int2, quant_int4, quant_int8, layer_idx  # noqa: E402
+
 SHARED_RE = re.compile(r"\.mlp\.shared_expert\.")
 
 
@@ -40,18 +39,21 @@ def rename_out(name):
     return SHARED_RE.sub(".mlp.shared_experts.", name)
 
 
-def classify(name, n_layers, keep_mtp=False):
-    if name.endswith("_scale_inv") or name.endswith("_scale"):
+def emit(out, name, w, bits):
+    """Write w to out under name, quantized to `bits` (bits>8 or non-2D => f32)."""
+    w = w.astype(np.float32)
+    if bits > 8 or w.ndim != 2:
+        out[name] = w
+        return
+    q, s = (quant_int2(w, bits) if bits <= 2 else
+            quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
+    out[name] = q
+    out[name + ".qs"] = s
+
+
+def classify(name):
+    if name.endswith("_scale") or name.endswith("_scale_inv"):
         return "consumed"
-    li = layer_idx(name)
-    if keep_mtp:
-        if li != n_layers:
-            return "skip"
-    else:
-        if li >= n_layers:
-            return "skip"
-    # keep f32: all norms, softmax router gate, shared-expert gate, and the small
-    # DeltaNet decay/conv params (per-row int quant would wreck the recurrence).
     if (name.endswith("norm.weight") or name == "model.norm.weight"
             or name.endswith("q_norm.weight") or name.endswith("k_norm.weight")
             or name.endswith("mlp.gate.weight")
@@ -61,45 +63,69 @@ def classify(name, n_layers, keep_mtp=False):
         return "f32"
     if name in ("model.embed_tokens.weight", "lm_head.weight"):
         return "io"
-    if ".mlp.experts." in name and name.endswith(".weight"):
-        return "x"
     if name.endswith(".weight"):
-        return "q"  # q/k/v/o_proj, in_proj_qkvz/ba, out_proj, shared_expert.*_proj
+        return "q"  # q/k/v/o_proj, in_proj_qkv/z/b/a, out_proj, shared_expert.*_proj
     return "f32"
 
 
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False):
+    from safetensors import safe_open
+    import torch
+    with safe_open(path, framework="pt") as f:
+        for name in f.keys():
+            li = layer_idx(name)
+            if li is not None and li >= 0 and li >= n_layers and not keep_mtp:
+                continue
+            # --- fused experts -> per-expert (the big reconciliation) ---
+            if name.endswith("mlp.experts.gate_up_proj"):
+                w = f.get_tensor(name).to(torch.float32).numpy()   # [E, 2I, D]
+                E, twoI, _ = w.shape
+                I = twoI // 2
+                pre = name[:-len("gate_up_proj")]                  # ...mlp.experts.
+                for j in range(E):
+                    emit(out_dict, f"{pre}{j}.gate_proj.weight", w[j, :I, :], xbits)
+                    emit(out_dict, f"{pre}{j}.up_proj.weight",   w[j, I:, :], xbits)
+                continue
+            if name.endswith("mlp.experts.down_proj"):
+                w = f.get_tensor(name).to(torch.float32).numpy()   # [E, D, I]
+                E = w.shape[0]
+                pre = name[:-len("down_proj")]
+                for j in range(E):
+                    emit(out_dict, f"{pre}{j}.down_proj.weight", w[j], xbits)
+                continue
+            # --- everything else ---
+            kind = classify(name)
+            if kind == "consumed":
+                continue
+            w = base.dequant(f, name)
+            oname = rename_out(name)
+            bits = io_bits if kind == "io" else (ebits if kind == "q" else 99)  # f32 => 99
+            emit(out_dict, oname, w, bits)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Qwen3.6 -> Colibri int4 container")
-    ap.add_argument("--repo", default="Qwen/Qwen3.6-35B-A3B")
-    ap.add_argument("--indir", default=None)
-    ap.add_argument("--outdir", required=False)
-    ap.add_argument("--ebits", type=int, default=4)
-    ap.add_argument("--io-bits", type=int, default=8)
-    ap.add_argument("--xbits", type=int, default=None)
+    ap = argparse.ArgumentParser(description="Qwen3.6 -> Colibri container")
+    ap.add_argument("--indir", required=True)
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--ebits", type=int, default=4, help="proj weights; >8 => f32")
+    ap.add_argument("--io-bits", type=int, default=8, help="embed/lm_head; >8 => f32")
+    ap.add_argument("--xbits", type=int, default=4, help="MoE experts")
     ap.add_argument("--n-layers", type=int, default=40)
-    ap.add_argument("--min-free-gb", type=float, default=20.0)
-    ap.add_argument("--mtp", action="store_true")
     a = ap.parse_args()
-    if a.xbits is None:
-        a.xbits = a.ebits
 
-    # Graft the Qwen classify/rename onto the shared shard machinery. convert_shard
-    # (defined in convert_hy3) looks these names up at call time, so reassigning the
-    # module globals is enough; dequant() already handles bf16 -> f32.
-    base.classify = classify
-    base.rename_out = rename_out
-
-    if a.indir:
-        if not a.outdir:
-            sys.exit("--outdir required with --indir")
-        base.convert_local(a.indir, a.outdir, a.n_layers, a.ebits, a.io_bits, a.xbits)
-        return
-
-    # --repo streaming path: convert_hy3.main delegates to the FP8 converter's remote
-    # loop with classify/dequant patched. For the 35B bring-up (M7) the simplest route
-    # is `hf download ... --local-dir qwen36` then --indir, so that's the supported path
-    # for now; wire the remote loop here once the tensor names are locked.
-    sys.exit("for now: hf download the repo to a dir, then rerun with --indir <dir>")
+    from safetensors.numpy import save_file
+    shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
+    os.makedirs(a.outdir, exist_ok=True)
+    for i, sp in enumerate(shards):
+        out = {}
+        convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
+        save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
+    for fn in ("config.json", "tokenizer.json", "tokenizer_config.json",
+               "generation_config.json", "chat_template.jinja"):
+        src = os.path.join(a.indir, fn)
+        if os.path.exists(src):
+            shutil.copy(src, a.outdir)
+    print(f"converted {len(shards)} shard(s) -> {a.outdir}")
 
 
 if __name__ == "__main__":

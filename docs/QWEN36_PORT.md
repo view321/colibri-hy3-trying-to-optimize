@@ -199,11 +199,13 @@ Dev workflow: **edit + build (`make hy3`) + run the tiny oracle locally** on Win
 6. Softmax+shared MoE router + MTP → full hybrid oracle N/N (fp32) then int4.
 7. Real 35B bring-up on RunPod + perf (CUDA/surgery/PREDICT), measure vs 5–10 tok/s.
 
-## 6b. Implementation status (authored, UNVALIDATED)
+## 6b. Implementation status — VALIDATED (32/32 bit-exact on the tiny oracle)
 
-The full text forward path is written and compiles; the Hy3 32/32 oracle stays green
-through every edit (all Qwen paths gate on `is_qwen36`/`attn_type`). **Nothing on the
-Qwen path has run yet** — validate on RunPod. Turn on traces with `QWEN_DEBUG=1`.
+The full text forward path is implemented AND validated locally (uv venv, CPU torch — no
+RunPod needed): the tiny hybrid oracle passes **32/32 f32** (bit-exact vs HF) and **29/32
+int8-experts** (the 3 flips are int8 expert-quant noise compounding through the DeltaNet
+recurrent state — 2 are sub-0.02-logit close-calls, the 3rd is the last position; f32
+experts give 32/32). Hy3 stays 32/32 throughout. Traces: `QWEN_DEBUG=1`.
 
 Done in `hy3.c`:
 - Config parsing (`load_cfg`): `layer_types`, `linear_*`, `partial_rotary_factor`,
@@ -226,22 +228,39 @@ Done in `hy3.c`:
    QWEN_DEBUG=1 ./hy3 64 16 16`; drive toward N/N, fixing the verify points below.
 3. Only then scale to the real 35B (M7).
 
-### Open verify points (most likely to be wrong)
-- **DeltaNet head grouping** `hk = hv/grp` (repeat_interleave vs interleaved).
-- **`beta = sigmoid(b)`**, **`g = -exp(A_log)·softplus(a+dt_bias)`**, **`decay=exp(g)`**.
-- **`RMSNormGated` order**: gate (×silu(z)) first, then RMS over vdim, then weight.
-- **q/k L2-norm** (not 1/√d scaling).
-- **conv** orientation/tap order and `conv_state` carry across decode steps.
-- **mRoPE→partial-RoPE** text collapse; partial rotary dim = `0.25·256 = 64`.
-- **Shared-expert gate**: Qwen2-MoE multiplied the shared expert by
-  `sigmoid(shared_expert_gate·x)`; **not implemented** (assumed absent in qwen3_5_moe) —
-  confirm, add if the oracle disagrees.
-- **MTP-for-Qwen**: the MTP head still builds a full-GQA layer; the real model's NEXTN
-  layer type isn't wired (tiny oracle uses `mtp=0`, so this doesn't block the base gate).
-- **State vs spec-decode**: `recur_state`/`conv_state` reset only at `pos_base==0`;
-  the spec-decode re-forward path may need explicit state save/restore.
-- **Deferred (perf, not correctness)**: KV/state split in `kv_alloc` (full KV still
-  allocated for linear layers); `sc[8192]` score cap; chunked-scan prefill.
+### Bugs found & fixed during bring-up (the oracle earned its keep)
+Against the real state_dict + HF per-layer activations, six things were wrong; all fixed:
+1. **DeltaNet has 4 SEPARATE projections** (`in_proj_qkv|z|b|a`), not fused `qkvz`/`ba`.
+2. **MoE experts are FUSED/batched** (`experts.gate_up_proj [E,2I,D]` + `down_proj [E,D,I]`) —
+   `convert_qwen36.py` unfuses to per-expert `gate/up/down_proj` (gate = first I rows).
+3. **`shared_expert_gate [1,D]` exists** — multiply the shared expert by `sigmoid(x·w)`.
+4. **Standard RMSNorm is zero-centered**: `x*r*(1+weight)` (`Qwen3_5MoeRMSNorm`; weights
+   store 0). Missing this **zeroed the entire forward**. The gated `linear_attn.norm` is plain.
+5. **RMSNormGated order is norm-FIRST**: normalize → weight → `×silu(z)` (I'd done gate-first).
+6. **DeltaNet query scale** `query *= 1/sqrt(k_head_dim)` after l2norm — NOT washed by the
+   RMSNorm here because `core` is tiny (~1e-3) so `eps` matters; missing it made `core` 4× big.
+
+Matched HF on the first try (no fix needed): `beta=sigmoid(b)`,
+`g=-exp(A_log)·softplus(a+dt_bias)`, `decay=exp(g)`, q/k L2-norm, `repeat_interleave` grouping
+`hv/grp`, causal conv tap order, softmax router + norm_topk, partial RoPE, mRoPE→partial text collapse.
+
+### Still open (not blocking the base gate)
+- **MTP-for-Qwen** NEXTN head (tiny oracle uses `mtp=0`; the real model has `mtp=1`).
+- **State vs spec-decode**: `recur_state`/`conv_state` reset only at `pos_base==0`; the
+  spec-decode re-forward may need explicit save/restore.
+- **Perf, deferred**: KV/state split in `kv_alloc` (full KV still allocated for linear layers —
+  wasteful at long ctx); `sc[8192]` score cap; chunked-scan prefill; int4 experts on the real
+  model (int8 already shows recurrent-noise sensitivity — measure quality with `quant_ablation`).
+
+### Local dev loop (no RunPod)
+```
+uv venv --python 3.12 <venv>; uv pip install --python <venv> torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python <venv> "transformers>=4.57.1" safetensors numpy
+<venv>/python tools/make_qwen36_oracle.py                        # -> qwen36_tiny/ + ref_qwen36.json
+<venv>/python tools/convert_qwen36.py --indir qwen36_tiny --outdir qwen36_tiny_f32 --ebits 16 --io-bits 16 --xbits 16
+make hy3 && SNAP=./qwen36_tiny_f32 TF=1 REF=ref_qwen36.json REF_FORCE=1 ./hy3.exe 64 16 16   # 32/32
+tools/dump_qwen36_hidden.py diffs HF per-layer activations when a stage is wrong.
+```
 
 ## 7. Open risks
 
