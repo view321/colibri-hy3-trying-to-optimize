@@ -79,7 +79,7 @@ def classify(name):
     return "f32"
 
 
-def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False):
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False, mtp_bits=None):
     from safetensors import safe_open
     import torch
     with safe_open(path, framework="pt") as f:
@@ -88,7 +88,8 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
             if name.startswith("model.visual") or ".visual." in name:
                 continue
             # NEXTN/MTP head: keep only with --mtp, remapped onto layer n_layers
-            if name.startswith("mtp"):
+            is_mtp = name.startswith("mtp")
+            if is_mtp:
                 if not keep_mtp:
                     continue
                 oname = remap_mtp(name, n_layers)
@@ -97,6 +98,10 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
                 # strip to model.* so the container matches the loader (no-op for the
                 # text-only tiny fixture; lm_head.weight is already top-level).
                 oname = name.replace("model.language_model.", "model.", 1)
+            # --mtp-bits overrides precision for the quant-sensitive NEXTN head only
+            # (its proj weights + its own 256 experts); everything else uses --ebits/--xbits.
+            eb = mtp_bits if (is_mtp and mtp_bits is not None) else ebits
+            xb = mtp_bits if (is_mtp and mtp_bits is not None) else xbits
             li = layer_idx(oname)
             if li is not None and li >= 0 and li >= n_layers and not keep_mtp:
                 continue   # drops the MTP layer (index n_layers) for now
@@ -107,15 +112,15 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
                 I = twoI // 2
                 pre = oname[:-len("gate_up_proj")]                 # ...mlp.experts.
                 for j in range(E):
-                    emit(out_dict, f"{pre}{j}.gate_proj.weight", w[j, :I, :], xbits)
-                    emit(out_dict, f"{pre}{j}.up_proj.weight",   w[j, I:, :], xbits)
+                    emit(out_dict, f"{pre}{j}.gate_proj.weight", w[j, :I, :], xb)
+                    emit(out_dict, f"{pre}{j}.up_proj.weight",   w[j, I:, :], xb)
                 continue
             if oname.endswith("mlp.experts.down_proj"):
                 w = f.get_tensor(name).to(torch.float32).numpy()   # [E, D, I]
                 E = w.shape[0]
                 pre = oname[:-len("down_proj")]
                 for j in range(E):
-                    emit(out_dict, f"{pre}{j}.down_proj.weight", w[j], xbits)
+                    emit(out_dict, f"{pre}{j}.down_proj.weight", w[j], xb)
                 continue
             # --- everything else ---
             kind = classify(oname)
@@ -123,7 +128,7 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
                 continue
             w = base.dequant(f, name)
             oname = rename_out(oname)
-            bits = io_bits if kind == "io" else (ebits if kind == "q" else 99)  # f32 => 99
+            bits = io_bits if kind == "io" else (eb if kind == "q" else 99)  # f32 => 99
             emit(out_dict, oname, w, bits)
 
 
@@ -136,6 +141,10 @@ def main():
     ap.add_argument("--xbits", type=int, default=4, help="MoE experts")
     ap.add_argument("--n-layers", type=int, default=40)
     ap.add_argument("--mtp", action="store_true", help="include the NEXTN/MTP head for speculative decode")
+    ap.add_argument("--mtp-bits", type=int, default=None,
+                    help="precision for the NEXTN/MTP head ONLY (its proj weights + its 256 experts); "
+                         "default = same as --ebits/--xbits. Use 16 to keep the head f32 and isolate "
+                         "whether low MTP acceptance is quant sensitivity vs a real bug.")
     a = ap.parse_args()
 
     from safetensors.numpy import save_file
@@ -143,7 +152,8 @@ def main():
     os.makedirs(a.outdir, exist_ok=True)
     for i, sp in enumerate(shards):
         out = {}
-        convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=a.mtp)
+        convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                      keep_mtp=a.mtp, mtp_bits=a.mtp_bits)
         save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
     for fn in ("config.json", "tokenizer.json", "tokenizer_config.json",
                "generation_config.json", "chat_template.jinja",
