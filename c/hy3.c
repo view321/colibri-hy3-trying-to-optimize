@@ -114,6 +114,19 @@ typedef struct {
     int route_norm;
     float eps, theta, router_scale;
     int stop_ids[8], n_stop;
+    /* --- Qwen3.6 (qwen3_5_moe) hybrid extensions. All default to Hy3 behavior
+     * (full GQA every layer, sigmoid+bias router) when the keys are absent, so
+     * the Hy3 path stays byte-for-byte unchanged. See docs/QWEN36_PORT.md. */
+    int is_qwen36;              /* model_type starts "qwen3_5"                     */
+    int router_softmax;         /* 1 = softmax(+norm_topk); 0 = Hy3 sigmoid+bias   */
+    int norm_topk;              /* renormalize the kept top-k gate weights         */
+    int shared_inter;           /* shared_expert_intermediate_size (0 => moe_inter*n_shared) */
+    float partial_rotary;       /* fraction of head_dim rotated by RoPE (default 1)*/
+    int full_attn_interval;     /* every Nth layer is full attention (fallback)    */
+    unsigned char attn_type[128];/* per layer: 0=full/GQA (default), 1=gated-deltanet */
+    int lin_k_heads, lin_k_dim; /* gated-deltanet key heads / dim                  */
+    int lin_v_heads, lin_v_dim; /* gated-deltanet value heads / dim                */
+    int lin_conv;               /* linear_conv_kernel_dim                          */
 } Cfg;
 
 typedef struct {
@@ -137,14 +150,24 @@ typedef struct {
     QT q, k, v, o;
     float *qn, *kn;
     int sparse;
+    int attn_type;              /* 0 = full/GQA attention, 1 = gated-deltanet */
     QT gate_proj, up_proj, down_proj;
     float *router, *router_bias;
     QT sh_gate, sh_up, sh_down;
+    /* --- gated-deltanet weights (attn_type==1); small params kept f32. TODO(M5) --- */
+    QT dn_in_qkvz, dn_in_ba, dn_out;   /* in_proj_qkvz, in_proj_ba, out_proj */
+    float *dn_conv;                     /* depthwise causal conv1d [conv_dim, kernel] */
+    float *dn_A_log, *dn_dt_bias;       /* per-v-head decay params */
+    float *dn_norm;                     /* RMSNormGated weight [value_dim] */
 } Layer;
 
 typedef struct {
     int eid; QT g,u,d; uint8_t *slab; float *fslab;
     int64_t slab_cap, fslab_cap; uint64_t used;
+    /* PREDICT_LOAD: 1 while a speculative worker is filling this slot's slabs.
+     * Set at claim (main thread), cleared by the worker (release); every other
+     * reader/mutator of cache slots stays on the main thread. */
+    _Atomic int busy;
 } ESlot;
 
 typedef struct {
@@ -156,18 +179,21 @@ typedef struct {
     int8_t **Kq, **Vq;
     float **Kscale, **Vscale;
     int *kv_start;                               /* prima pos valida nella KV (MTP: parziale) */
+    float **recur_state, **conv_state;           /* gated-deltanet per-layer state; NULL for full-attn layers (M5) */
     ESlot **ecache; int *ecn; int ecap;
     ESlot **pin; int *npin;
     ESlot ws[64];
     uint64_t eclock, hits, miss, ereq;
     uint32_t **eusage;
     uint32_t **eheat;
+    float **esal;                                /* SALIENCY: somma dei gate post-norm applicati per (layer,expert) */
     /* cross-layer expert prediction (PREDICT): per-layer bitmask of experts
      * predicted for that layer's NEXT visit, readahead-hinted from an earlier
      * layer. Consumed (measured + cleared) when the layer's moe() runs. */
     uint64_t **pred_mask; int *pred_np;
     float *pred_nrm, *pred_logit, *pred_choice;  /* prediction scratch (main thread only) */
     uint64_t pred_hit, pred_seen, pred_issued;
+    uint64_t spec_enq, spec_drop, spec_wait;     /* PREDICT_LOAD: queued / dropped / compute-side waits */
     /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
     int has_mtp; Layer mtpL; QT eh_proj;
     float *enorm, *hnorm, *mtp_norm;
@@ -280,6 +306,8 @@ static float g_topp=0;
 static int g_draft=-1;   /* -1 = auto: 3 se MTP, 0 senza */
 static int g_predict=0;    /* PREDICT: layers ahead to predict+prefetch routed experts (0=off) */
 static int g_predict_k=0;  /* PREDICT_K: experts hinted per predicted layer (0=auto: topk) */
+static int g_predict_load=0; /* PREDICT_LOAD: predictions become async expert loads into the LRU (see spec pool) */
+static int g_spec_nw=8;      /* SPEC_WORKERS: threads serving speculative loads */
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
@@ -413,6 +441,22 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "scalar"
 #endif
 static int g_idot=1, g_nopack=0, g_drop=0, g_direct=0;
+/* ---- checkpoint-surgery support (see docs/SURGERY.md) ----
+ * GATE_TAU: after top-k selection drop routed experts whose sigmoid gate is
+ * below tau*max(selected gates), then renormalize over the survivors. Fewer
+ * experts fetched per token (the disk-bound win) at a measured quality cost:
+ * output is NOT bit-identical, so it ships OFF (GATE_TAU=0) by default.
+ * SALIENCY: accumulate per-(layer,expert) sums of the APPLIED post-norm gate
+ * weights into <SNAP>/.coli_saliency (default on; SALIENCY=0 disables). This is
+ * the pruning criterion for tools/surgery_hy3.py — frequency (.coli_usage)
+ * cannot tell a dominant expert from a barely-8th-place one, gate mass can.
+ * ROUTE_TRACE=path: append one "<layer> <e1> ... <ek>" line per (token,layer)
+ * with the routed expert ids — co-activation data for surgery's --reorder coact.
+ * Neither observer changes routing; only GATE_TAU does. */
+static float g_gate_tau=0;
+static uint64_t g_gate_tok=0, g_gate_kept=0;
+static int g_saliency=1;
+static FILE *g_trace=NULL;
 /* int4/int2 IDOT at every S, including S=1 decode. glm's original x86 measurement
  * (f32 path wins at S=1) predates the raw-offset kernels: without the sub/sign work
  * the offset form measures 1.9x FASTER than the f32 path at S=1 on plain AVX2
@@ -1003,6 +1047,33 @@ static void rope_rotate_half(float *x, int pos, float theta, int hd){
     }
 }
 
+/* ===================== Qwen3.6 (qwen3_5_moe) support ===================== */
+static int g_qwen_dbg=0;   /* set from QWEN_DEBUG in load_cfg */
+#define QDBG(...) do{ if(g_qwen_dbg) fprintf(stderr,"[qwen] " __VA_ARGS__); }while(0)
+
+/* partial rotate_half: rotate only the first `rot` dims (rot<=hd), pass the rest
+ * through unchanged. Frequencies use `rot` as the rotary dim. rot==hd == full RoPE.
+ * mRoPE note: for text-only input the t/h/w position components are all equal to the
+ * token position, so mRoPE collapses to this standard partial RoPE (verify on RunPod). */
+static void rope_rotate_half_partial(float *x, int pos, float theta, int rot){
+    int h2=rot/2; float tmp[512];
+    if(rot<2) return;
+    if(rot>512){ fprintf(stderr,"rot too large\n"); exit(1); }
+    memcpy(tmp,x,(size_t)rot*sizeof(float));
+    for(int j=0;j<h2;j++){
+        float inv=powf(theta,-2.0f*j/(float)rot), ang=pos*inv, c=cosf(ang), s=sinf(ang);
+        float x1=tmp[j], x2=tmp[j+h2];
+        x[j]=x1*c-x2*s; x[j+h2]=x2*c+x1*s;
+    }
+}
+
+/* in-place L2 normalize (DeltaNet q/k): x * rsqrt(sum(x^2)+eps), HF eps=1e-6. */
+static void l2norm_vec(float *x, int n, float eps){
+    float s=0; for(int i=0;i<n;i++) s+=x[i]*x[i];
+    float inv=1.0f/sqrtf(s+eps);
+    for(int i=0;i<n;i++) x[i]*=inv;
+}
+
 static jval* cfg_root(const char *snap, char **arena){
     char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
     FILE *f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
@@ -1014,7 +1085,10 @@ static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0
 static float gf(jval*r,const char*k, float def){ jval*v=json_get(r,k); return v?(float)v->num:def; }
 
 static void load_cfg(Cfg *c, const char *snap){
-    char *ar=NULL; jval *r=cfg_root(snap,&ar);
+    char *ar=NULL; jval *top=cfg_root(snap,&ar);
+    /* qwen3_5_moe nests the LM fields under "text_config"; Hy3 is flat. Read LM
+     * fields from text_config when present, else from the top-level object. */
+    jval *tc=json_get(top,"text_config"); jval *r=tc?tc:top;
     c->hidden=gi(r,"hidden_size"); c->n_layers=gi(r,"num_hidden_layers");
     c->n_heads=gi(r,"num_attention_heads"); c->n_kv_heads=gi(r,"num_key_value_heads");
     c->n_experts=gi(r,"num_experts"); c->topk=gi(r,"num_experts_per_tok");
@@ -1032,6 +1106,33 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *eo=json_get(r,"eos_token_id");
     if(eo){ if(eo->t==J_NUM) c->stop_ids[c->n_stop++]=(int)eo->num;
             else if(eo->t==J_ARR) for(int i=0;i<eo->len&&c->n_stop<8;i++) c->stop_ids[c->n_stop++]=(int)eo->kids[i]->num; }
+    /* --- Qwen3.6 (qwen3_5_moe) hybrid config; defaults preserve the Hy3 path --- */
+    memset(c->attn_type,0,sizeof(c->attn_type));
+    c->router_softmax=0; c->norm_topk=0; c->partial_rotary=1.0f; c->shared_inter=0;
+    c->full_attn_interval=0; c->lin_k_heads=c->lin_k_dim=c->lin_v_heads=c->lin_v_dim=c->lin_conv=0;
+    jval *mt=json_get(top,"model_type"); if(!mt) mt=json_get(r,"model_type");
+    c->is_qwen36=(mt&&mt->t==J_STR&&strncmp(mt->str,"qwen3_5",7)==0);
+    g_qwen_dbg=getenv("QWEN_DEBUG")?atoi(getenv("QWEN_DEBUG")):0;
+    c->full_attn_interval=gi(r,"full_attention_interval");
+    c->lin_k_heads=gi(r,"linear_num_key_heads"); c->lin_k_dim=gi(r,"linear_key_head_dim");
+    c->lin_v_heads=gi(r,"linear_num_value_heads"); c->lin_v_dim=gi(r,"linear_value_head_dim");
+    c->lin_conv=gi(r,"linear_conv_kernel_dim");
+    c->shared_inter=gi(r,"shared_expert_intermediate_size");
+    c->partial_rotary=gf(r,"partial_rotary_factor",1.0f);
+    jval *lt=json_get(r,"layer_types");
+    if(lt&&lt->t==J_ARR){
+        for(int i=0;i<lt->len&&i<128;i++){ jval *e=lt->kids[i];
+            if(e&&e->t==J_STR&&strstr(e->str,"linear")) c->attn_type[i]=1; }
+    } else if(c->full_attn_interval>0){
+        for(int i=0;i<c->n_layers&&i<128;i++) c->attn_type[i]=((i+1)%c->full_attn_interval)?1:0;
+    }
+    jval *sig=json_get(r,"moe_router_use_sigmoid");
+    if(sig&&sig->t==J_BOOL) c->router_softmax=!sig->boolean;
+    else if(c->is_qwen36) c->router_softmax=1;
+    jval *nt=json_get(r,"norm_topk_prob");
+    if(nt&&nt->t==J_BOOL) c->norm_topk=nt->boolean; else if(c->router_softmax) c->norm_topk=1;
+    if(c->is_qwen36 && c->shared_inter==0) c->shared_inter=c->moe_inter;
+    if(c->is_qwen36) c->route_norm=c->norm_topk;   /* softmax norm_topk_prob == the route_norm renorm */
     if(c->n_heads%c->n_kv_heads){ fprintf(stderr,"n_heads must divide n_kv_heads evenly\n"); exit(1); }
     #define CK(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ fprintf(stderr,"config: %s=%d out of range\n",name,(int)(v)); exit(1); }
     CK("hidden_size",c->hidden,1,1<<20) CK("num_hidden_layers",c->n_layers,1,128)
@@ -1391,6 +1492,79 @@ static void expert_prefetch(Model *m, int layer, int eid){
     }
 }
 
+/* ---- PREDICT_LOAD: speculative expert loads into the per-layer LRU ----
+ *
+ * The default PREDICT transport (fadvise WILLNEED) only warms the page cache.
+ * That is useless under DIRECT=1 (O_DIRECT bypasses the cache), a no-op on
+ * Windows, and fragile when the engine's own LRU owns most of RAM (little free
+ * memory is left for page cache, so the kernel may drop the readahead before
+ * the layer arrives). PREDICT_LOAD=1 turns each prediction into a real
+ * expert_load() run by this worker pool, landing directly in the target
+ * layer's LRU slot — prefetch works with O_DIRECT / DROP=1 / Windows, and a
+ * predicted hit costs zero extra copies at consume time.
+ *
+ * Threading contract: claims (victim choice, eid, LRU clock) happen on the
+ * main thread only, so ALL cache bookkeeping stays single-threaded. A worker
+ * only fills the claimed slot's slabs and clears the busy flag (release);
+ * moe() acquires busy==0 before compute. Slots being filled are skipped by
+ * every eviction scan (spec claim + moe promote). */
+typedef struct { Model *m; ESlot *slot; int layer, eid; } SpecJob;
+static struct {
+    SpecJob q[64]; int head, tail, n;
+    pthread_mutex_t mx; pthread_cond_t cv;
+    pthread_t th[16]; int nw, started;
+} g_spec;
+
+static void *spec_worker(void *arg){
+    (void)arg;
+    for(;;){
+        pthread_mutex_lock(&g_spec.mx);
+        while(g_spec.n==0) pthread_cond_wait(&g_spec.cv,&g_spec.mx);
+        SpecJob j=g_spec.q[g_spec.head]; g_spec.head=(g_spec.head+1)&63; g_spec.n--;
+        pthread_mutex_unlock(&g_spec.mx);
+        expert_load(j.m,j.layer,j.eid,j.slot);
+        atomic_store_explicit(&j.slot->busy,0,memory_order_release);
+    }
+    return NULL;
+}
+static void spec_init(void){
+    if(g_spec.started) return;
+    pthread_mutex_init(&g_spec.mx,NULL); pthread_cond_init(&g_spec.cv,NULL);
+    if(g_spec_nw<1) g_spec_nw=1; if(g_spec_nw>16) g_spec_nw=16;
+    int ok=0;
+    for(int i=0;i<g_spec_nw;i++) if(!pthread_create(&g_spec.th[i],NULL,spec_worker,NULL)) ok++;
+    g_spec.nw=ok; g_spec.started=1;
+    if(!ok){ fprintf(stderr,"[PREDICT] speculative pool unavailable, falling back to hints\n"); g_predict_load=0; }
+}
+/* Claim an LRU slot of layer T for expert eid and queue its load. Main thread
+ * only. Returns 1 if queued; 0 when the queue is full or every slot of the
+ * layer is mid-fill (callers may fall back to a plain fadvise hint). */
+static int spec_load_hint(Model *m, int T, int eid){
+    if(!g_spec.started){ spec_init(); if(!g_predict_load) return 0; }
+    ESlot *Sl=m->ecache[T]; if(!Sl) return 0;
+    pthread_mutex_lock(&g_spec.mx);
+    if(g_spec.n>=64){ pthread_mutex_unlock(&g_spec.mx); m->spec_drop++; return 0; }
+    ESlot *dst=NULL;
+    if(m->ecn[T]<m->ecap) dst=&Sl[m->ecn[T]++];
+    else { int lru=-1;
+        for(int z=0;z<m->ecn[T];z++){
+            if(atomic_load_explicit(&Sl[z].busy,memory_order_relaxed)) continue;
+            if(lru<0||Sl[z].used<Sl[lru].used) lru=z; }
+        if(lru>=0) dst=&Sl[lru];
+    }
+    if(!dst){ pthread_mutex_unlock(&g_spec.mx); m->spec_drop++; return 0; }
+#ifdef COLI_CUDA
+    if(dst->eid!=eid){ qt_cuda_reset(&dst->g); qt_cuda_reset(&dst->u); qt_cuda_reset(&dst->d); }
+#endif
+    dst->eid=eid; dst->used=++m->eclock;
+    atomic_store_explicit(&dst->busy,1,memory_order_relaxed);
+    g_spec.q[g_spec.tail]=(SpecJob){m,dst,T,eid}; g_spec.tail=(g_spec.tail+1)&63; g_spec.n++;
+    m->spec_enq++;
+    pthread_cond_signal(&g_spec.cv);
+    pthread_mutex_unlock(&g_spec.mx);
+    return 1;
+}
+
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap); st_init(&m->S,snap);
@@ -1417,11 +1591,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 #endif
     m->final_norm=ld(m,"model.norm.weight");
     m->L=calloc(c->n_layers,sizeof(Layer));
+    m->recur_state=calloc(c->n_layers,sizeof(float*));  /* gated-deltanet state (M5); per-layer buf alloc'd lazily */
+    m->conv_state =calloc(c->n_layers,sizeof(float*));
     int nrows=c->n_layers+1;
     m->ecap=cap; m->ecache=calloc(nrows,sizeof(ESlot*)); m->ecn=calloc(nrows,sizeof(int));
     m->pin=calloc(nrows,sizeof(ESlot*)); m->npin=calloc(nrows,sizeof(int));
     m->eusage=calloc(nrows,sizeof(uint32_t*));
     m->eheat=calloc(nrows,sizeof(uint32_t*));
+    m->esal=calloc(nrows,sizeof(float*));
     m->pred_mask=calloc(nrows,sizeof(uint64_t*));
     m->pred_np=calloc(nrows,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
@@ -1429,12 +1606,27 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
-        l->q=qt_load(m,P("self_attn.q_proj.weight"),qo,D,dbits);
-        l->k=qt_load(m,P("self_attn.k_proj.weight"),kvo,D,dbits);
-        l->v=qt_load(m,P("self_attn.v_proj.weight"),kvo,D,dbits);
-        l->o=qt_load(m,P("self_attn.o_proj.weight"),D,qo,dbits);
-        l->qn=ld(m,P("self_attn.q_norm.weight"));
-        l->kn=ld(m,P("self_attn.k_norm.weight"));
+        l->attn_type=c->attn_type[i];
+        if(l->attn_type==0){                 /* full/GQA attention (Hy3 = every layer) */
+            int q_out = c->is_qwen36 ? qo*2 : qo;   /* qwen packs [query|gate] per head */
+            l->q=qt_load(m,P("self_attn.q_proj.weight"),q_out,D,dbits);
+            l->k=qt_load(m,P("self_attn.k_proj.weight"),kvo,D,dbits);
+            l->v=qt_load(m,P("self_attn.v_proj.weight"),kvo,D,dbits);
+            l->o=qt_load(m,P("self_attn.o_proj.weight"),D,qo,dbits);
+            l->qn=ld(m,P("self_attn.q_norm.weight"));
+            l->kn=ld(m,P("self_attn.k_norm.weight"));
+        } else {                             /* gated-deltanet (Qwen3.6 linear layers) */
+            int kd=c->lin_k_heads*c->lin_k_dim, vd=c->lin_v_heads*c->lin_v_dim;
+            int qkvz=2*kd+2*vd, ba=2*c->lin_v_heads;
+            l->dn_in_qkvz=qt_load(m,P("linear_attn.in_proj_qkvz.weight"),qkvz,D,dbits);
+            l->dn_in_ba  =qt_load(m,P("linear_attn.in_proj_ba.weight"),ba,D,dbits);
+            l->dn_out    =qt_load(m,P("linear_attn.out_proj.weight"),D,vd,dbits);
+            l->dn_conv   =ld(m,P("linear_attn.conv1d.weight"));   /* [conv_dim,1,kernel] */
+            l->dn_A_log  =ld(m,P("linear_attn.A_log"));
+            l->dn_dt_bias=ld(m,P("linear_attn.dt_bias"));
+            l->dn_norm   =ld(m,P("linear_attn.norm.weight"));
+            QDBG("load L%d deltanet: kd=%d vd=%d qkvz=%d ba=%d conv_k=%d\n",i,kd,vd,qkvz,ba,c->lin_conv);
+        }
         l->sparse=(i>=c->first_dense);
         if(!l->sparse){
             l->gate_proj=qt_load(m,P("mlp.gate_proj.weight"),c->dense_inter,D,dbits);
@@ -1444,9 +1636,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.router.gate.weight",i);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight",i);
             l->router=ld_first(m,nm2,nm);
-            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.expert_bias",i);
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias",i);
-            l->router_bias=ld_first(m,nm2,nm);
+            if(c->router_softmax){ l->router_bias=NULL; }   /* softmax router has no expert bias */
+            else {
+                snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.expert_bias",i);
+                snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias",i);
+                l->router_bias=ld_first(m,nm2,nm);
+            }
             int sI=c->moe_inter*c->n_shared;
             snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.gate_proj.weight",i);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.gate_proj.weight",i);
@@ -1460,6 +1655,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->esal[i]=calloc(c->n_experts,sizeof(float));
             m->pred_mask[i]=calloc((c->n_experts+63)/64,sizeof(uint64_t));
         }
         #undef P
@@ -1512,9 +1708,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.router.gate.weight",i);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight",i);
             l->router=ld_first(m,nm2,nm);
-            snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.expert_bias",i);
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias",i);
-            l->router_bias=ld_first(m,nm2,nm);
+            if(c->router_softmax){ l->router_bias=NULL; }   /* softmax router has no expert bias */
+            else {
+                snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.expert_bias",i);
+                snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias",i);
+                l->router_bias=ld_first(m,nm2,nm);
+            }
             int sI=c->moe_inter*c->n_shared;
             snprintf(nm2,sizeof(nm2),"model.layers.%d.mlp.shared_experts.gate_proj.weight",i);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_mlp.gate_proj.weight",i);
@@ -1534,6 +1733,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
             m->eheat[i]=calloc(c->n_experts,sizeof(uint32_t));
+            m->esal[i]=calloc(c->n_experts,sizeof(float));
             m->pred_mask[i]=calloc((c->n_experts+63)/64,sizeof(uint64_t));
             #undef PM
         }
@@ -1710,6 +1910,67 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     free(Q); free(Kp); free(Vp); free(ctx);
 }
 
+/* Qwen3.6 gated full attention (the full_attention layers). q_proj emits
+ * [query|gate] per head; per-head QK-RMSNorm; PARTIAL rotary; GQA over the float
+ * KV cache; then ctx *= sigmoid(gate) before o_proj. CPU float path for RunPod
+ * bring-up (no CUDA / int8-KV / tree-mask yet). See docs/QWEN36_PORT.md §2b. */
+static void attention_qwen(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
+    Cfg *c=&m->c; int H=c->n_heads, Hkv=c->n_kv_heads, hd=c->head_dim;
+    int nrep=H/Hkv; float scale=1.f/sqrtf((float)hd);
+    int rot=(int)(c->partial_rotary*hd); if(rot<2) rot=hd; if(rot>hd) rot=hd;
+    double ta0=now_s();
+    int64_t qsz=(int64_t)S*H*hd, kv_sz=(int64_t)S*Hkv*hd;
+    float *Q2=falloc((int64_t)S*H*hd*2), *Q=falloc(qsz), *G=falloc(qsz);
+    float *Kp=falloc(kv_sz), *Vp=falloc(kv_sz), *ctx=falloc(qsz);
+    matmul_qt(Q2,x,&l->q,S); matmul_qt(Kp,x,&l->k,S); matmul_qt(Vp,x,&l->v,S);
+    /* split [query|gate]: q_proj row is [H, 2*hd] -> query = first hd, gate = second hd */
+    for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+        const float *src=Q2+((int64_t)s*H+h)*2*hd;
+        memcpy(Q+((int64_t)s*H+h)*hd, src,    (size_t)hd*sizeof(float));
+        memcpy(G+((int64_t)s*H+h)*hd, src+hd, (size_t)hd*sizeof(float));
+    }
+    for(int s=0;s<S;s++){
+        int pos=pos_base+s;
+        for(int h=0;h<H;h++){
+            float *qh=Q+((int64_t)s*H+h)*hd;
+            rmsnorm_head(qh,qh,l->qn,hd,c->eps);
+            rope_rotate_half_partial(qh,pos,c->theta,rot);
+        }
+        for(int kh=0;kh<Hkv;kh++){
+            float *kk=Kp+((int64_t)s*Hkv+kh)*hd, *vv=Vp+((int64_t)s*Hkv+kh)*hd;
+            rmsnorm_head(kk,kk,l->kn,hd,c->eps);
+            rope_rotate_half_partial(kk,pos,c->theta,rot);
+            memcpy(m->K[layer]+((int64_t)kh*m->max_t+pos)*hd,kk,(size_t)hd*sizeof(float));
+            memcpy(m->V[layer]+((int64_t)kh*m->max_t+pos)*hd,vv,(size_t)hd*sizeof(float));
+        }
+    }
+    #pragma omp parallel for collapse(2) schedule(static)
+    for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+        int pos=pos_base+s, kvh=h/nrep;
+        const float *qv=Q+((int64_t)s*H+h)*hd;
+        int st0=(m->kv_start&&m->kv_start[layer]>=0)?m->kv_start[layer]:0;
+        int nt=pos+1-st0;
+        float sc[8192]; int nv=0;
+        for(int jj=0;jj<nt&&nv<8192;jj++){ int t=st0+jj;
+            const float *kv=m->K[layer]+((int64_t)kvh*m->max_t+t)*hd;
+            sc[nv++]=dot_avx2(qv,kv,hd)*scale;
+        }
+        float *cx=ctx+((int64_t)s*H+h)*hd;
+        for(int d=0;d<hd;d++) cx[d]=0;
+        if(nv<1) continue;
+        softmax(sc,nv);
+        for(int jj=0;jj<nv;jj++){ int t=st0+jj;
+            const float *vv=m->V[layer]+((int64_t)kvh*m->max_t+t)*hd;
+            axpy_avx2(cx,vv,sc[jj],hd);
+        }
+    }
+    for(int64_t i=0;i<qsz;i++) ctx[i]*=1.0f/(1.0f+expf(-G[i]));   /* sigmoid output gate */
+    matmul_qt(out,ctx,&l->o,S);
+    m->t_attn+=now_s()-ta0;
+    QDBG("full L%d: rot=%d S=%d q0=%.4f g0=%.4f out0=%.4f\n",layer,rot,S,Q[0],G[0],out[0]);
+    free(Q2); free(Q); free(G); free(Kp); free(Vp); free(ctx);
+}
+
 static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     float *g=falloc((int64_t)S*I), *u=falloc((int64_t)S*I);
     matmul_qt(g,x,&l->gate_proj,S); matmul_qt(u,x,&l->up_proj,S);
@@ -1867,7 +2128,8 @@ static void predict_prefetch(Model *m, int layer, const float *xres, int S){
         for(int s=0;s<S;s++){
             rmsnorm(m->pred_nrm,xres+(int64_t)s*D,Lt->post_ln,D,c->eps);
             matmul(m->pred_logit,m->pred_nrm,Lt->router,1,D,E);
-            for(int e=0;e<E;e++) m->pred_choice[e]=sigmoidf(m->pred_logit[e])+Lt->router_bias[e];
+            if(c->router_softmax){ softmax(m->pred_logit,E); for(int e=0;e<E;e++) m->pred_choice[e]=m->pred_logit[e]; }
+            else for(int e=0;e<E;e++) m->pred_choice[e]=sigmoidf(m->pred_logit[e])+Lt->router_bias[e];
             int idx[64];
             for(int kk=0;kk<PK;kk++){ int best=-1; float bv=-1e30f;
                 for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
@@ -1876,7 +2138,12 @@ static void predict_prefetch(Model *m, int layer, const float *xres, int S){
                 idx[kk]=best;
                 if(mask[best>>6]>>(best&63)&1) continue;   /* already predicted for T */
                 mask[best>>6]|=1ull<<(best&63); m->pred_np[T]++;
-                if(!(have[best>>6]>>(best&63)&1)){ expert_prefetch(m,T,best); m->pred_issued++; }
+                if(!(have[best>>6]>>(best&63)&1)){
+                    if(g_predict_load){
+                        if(spec_load_hint(m,T,best)) m->pred_issued++;
+                        else if(!g_direct){ expert_prefetch(m,T,best); m->pred_issued++; }
+                    } else { expert_prefetch(m,T,best); m->pred_issued++; }
+                }
             }
         }
     }
@@ -1892,7 +2159,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int 
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D;
         matmul(logit,xs,l->router,1,D,E);
-        for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
+        if(c->router_softmax){ softmax(logit,E); for(int e=0;e<E;e++) choice[e]=logit[e]; }  /* Qwen: softmax, no bias */
+        else for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel=g_topk>0?(g_topk<K?g_topk:K):K;
         for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
@@ -1907,6 +2175,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int 
             float tot=1e-20f; for(int kk=0;kk<Ksel;kk++) tot+=w[kk];
             float cum=0; for(int kk=0;kk<Ksel;kk++){ cum+=w[kk]; if(cum>=g_topp*tot){ Ke=kk+1; break; } }
         }
+        /* GATE_TAU: drop selected experts whose raw gate is far below the strongest
+         * (w < tau*max), then let route_norm below renormalize the survivors. The
+         * max-gate expert always survives (tau<=1), so Ke>=1. Composes with TOPK
+         * (hard cap) and TOPP (cumulative mass) above. NOT bit-identical when >0. */
+        if(g_gate_tau>0.f&&Ke>1){
+            float wmax=w[0]; for(int kk=1;kk<Ke;kk++) if(w[kk]>wmax) wmax=w[kk];
+            float thr=g_gate_tau*wmax; int kw=0;
+            for(int kk=0;kk<Ke;kk++) if(w[kk]>=thr){ idx[kw]=idx[kk]; w[kw]=w[kk]; kw++; }
+            Ke=kw;
+        }
+        if(g_gate_tau>0.f){ g_gate_tok++; g_gate_kept+=(uint64_t)Ke; }
         keff[s]=Ke; m->ereq+=Ke;
         for(int kk=0;kk<Ke;kk++){
             if(m->eusage[layer]) m->eusage[layer][idx[kk]]++;
@@ -1914,6 +2193,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int 
         }
         if(c->route_norm){ float sm=1e-20f; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->router_scale;
+        /* surgery observers (no effect on routing): saliency accumulates the gate
+         * weight actually APPLIED to each expert's output; the route trace logs the
+         * per-(token,layer) co-activated set. moe() runs on the main thread only. */
+        if(g_saliency&&m->esal[layer]) for(int kk=0;kk<Ke;kk++) m->esal[layer][idx[kk]]+=w[kk];
+        if(g_trace){ fprintf(g_trace,"%d",layer); for(int kk=0;kk<Ke;kk++) fprintf(g_trace," %d",idx[kk]); fputc('\n',g_trace); }
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }
     int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
@@ -1975,6 +2259,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int 
         /* Wait for every pending disk load in this block before any compute, so the
          * GPU batch below sees all experts resident in RAM. */
         for(int j=0;j<nb;j++) if(g_pipe&&qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_edisk+=now_s()-tw; }
+        /* PREDICT_LOAD: an LRU hit may still be mid-fill by a speculative worker;
+         * acquire busy==0 so compute sees the finalized slabs. */
+        if(g_predict_load) for(int j=0;j<nb;j++)
+            if(atomic_load_explicit(&use[j]->busy,memory_order_acquire)){
+                double tw=now_s();
+                while(atomic_load_explicit(&use[j]->busy,memory_order_acquire)) sched_yield();
+                m->t_edisk+=now_s()-tw; m->spec_wait++;
+            }
         /* Per-expert row lists, packed contiguously into rows[]/rw[] at Eoff[j]. */
         int Eoff[64],Enr[64],tot=0;
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; int nr=0;
@@ -2013,7 +2305,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int 
           int promo=nmiss<m->ecap?nmiss:m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
+              else { int lru=-1;
+                  for(int z=0;z<*nn;z++){ /* never steal a slot a speculative worker is filling */
+                      if(g_predict_load&&atomic_load_explicit(&Sl[z].busy,memory_order_relaxed)) continue;
+                      if(lru<0||Sl[z].used<Sl[lru].used) lru=z; }
+                  if(lru<0) break;
+                  dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
         }
     }
@@ -2044,10 +2341,91 @@ static void moe(Model *m, Layer *l, int layer, float *x, const float *xres, int 
     if(xbatch) free(xbatch); if(ybatch) free(ybatch);
 }
 
+static inline float softplusf(float x){ return x>20.f ? x : log1pf(expf(x)); }
+
+/* Gated DeltaNet linear-attention layer (Qwen3.6 linear layers). Simple O(S)
+ * sequential recurrence — correct for prefill and decode; the chunked-scan speedup
+ * is deferred to M7. State persists in m->recur_state/conv_state and resets at
+ * sequence start (pos_base==0). See docs/QWEN36_PORT.md §2a.
+ * OPEN VERIFY POINTS (log with QWEN_DEBUG=1, confirm on RunPod vs the oracle):
+ *   - head grouping hv/grp (repeat_interleave assumption)
+ *   - beta = sigmoid(b);  g = -exp(A_log)*softplus(a+dt_bias);  decay = exp(g)
+ *   - RMSNormGated order: gate (×silu(z)) FIRST, then normalize over vdim, then weight
+ *   - q/k use L2-norm (not 1/sqrt(d) scaling) */
+static void gated_deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
+    Cfg *c=&m->c;
+    int kh=c->lin_k_heads, kdim=c->lin_k_dim, vh=c->lin_v_heads, vdim=c->lin_v_dim, K=c->lin_conv;
+    int kd=kh*kdim, vd=vh*vdim, convd=2*kd+vd, grp=(kh>0?vh/kh:1);
+    int qkvz=2*kd+2*vd, ba=2*vh;
+    double ta0=now_s();
+    float *PZ=falloc((int64_t)S*qkvz), *PB=falloc((int64_t)S*ba);
+    matmul_qt(PZ,x,&l->dn_in_qkvz,S); matmul_qt(PB,x,&l->dn_in_ba,S);
+    if(!m->recur_state[layer]) m->recur_state[layer]=falloc((int64_t)vh*kdim*vdim);
+    if(!m->conv_state[layer])  m->conv_state[layer]=falloc((int64_t)convd*(K>1?K-1:1));
+    float *St=m->recur_state[layer], *cst=m->conv_state[layer];
+    if(pos_base==0){ memset(St,0,(size_t)vh*kdim*vdim*sizeof(float));
+                     memset(cst,0,(size_t)convd*(K>1?K-1:1)*sizeof(float)); }
+    const float *cw=l->dn_conv;                         /* [convd,1,K] -> cw[ch*K+j] */
+    float *mixed=falloc((int64_t)S*convd);
+    /* causal depthwise conv over [q,k,v] (first convd cols of qkvz) + silu */
+    for(int s=0;s<S;s++) for(int ch=0;ch<convd;ch++){
+        float acc=0;
+        for(int j=0;j<K;j++){
+            int rel=s-(K-1)+j; float xin;
+            if(rel>=0) xin=PZ[(int64_t)rel*qkvz+ch];
+            else { int hist=(K-1)+rel; xin=(K>1)?cst[(int64_t)ch*(K-1)+hist]:0.f; }
+            acc+=cw[ch*K+j]*xin;
+        }
+        mixed[(int64_t)s*convd+ch]=acc/(1.f+expf(-acc));
+    }
+    if(K>1){                                            /* advance conv_state = last K-1 raw inputs */
+        float *ncst=falloc((int64_t)convd*(K-1));
+        for(int ch=0;ch<convd;ch++) for(int t=0;t<K-1;t++){
+            int rel=S-(K-1)+t; float xin;
+            if(rel>=0) xin=PZ[(int64_t)rel*qkvz+ch];
+            else { int hist=(K-1)+rel; xin=cst[(int64_t)ch*(K-1)+hist]; }
+            ncst[(int64_t)ch*(K-1)+t]=xin;
+        }
+        memcpy(cst,ncst,(size_t)convd*(K-1)*sizeof(float)); free(ncst);
+    }
+    float *core=falloc((int64_t)S*vd), *kvmem=falloc(vdim), *delta=falloc(vdim);
+    for(int s=0;s<S;s++){
+        float *q_all=mixed+(int64_t)s*convd, *k_all=q_all+kd, *v_all=k_all+kd;
+        const float *z_all=PZ+(int64_t)s*qkvz+2*kd+vd;   /* z = 4th split of qkvz */
+        const float *bb=PB+(int64_t)s*ba, *aa=bb+vh;
+        for(int h=0;h<kh;h++){ l2norm_vec(q_all+h*kdim,kdim,1e-6f); l2norm_vec(k_all+h*kdim,kdim,1e-6f); }
+        for(int hv=0;hv<vh;hv++){
+            int hk=hv/grp;
+            const float *qv=q_all+hk*kdim, *kv_=k_all+hk*kdim, *vv=v_all+hv*vdim;
+            float beta=1.f/(1.f+expf(-bb[hv]));
+            float decay=expf(-expf(l->dn_A_log[hv])*softplusf(aa[hv]+l->dn_dt_bias[hv]));
+            float *Sh=St+(int64_t)hv*kdim*vdim;
+            for(int j=0;j<kdim;j++){ float *row=Sh+(int64_t)j*vdim; for(int d=0;d<vdim;d++) row[d]*=decay; }
+            for(int d=0;d<vdim;d++) kvmem[d]=0;
+            for(int j=0;j<kdim;j++){ float kj=kv_[j], *row=Sh+(int64_t)j*vdim; for(int d=0;d<vdim;d++) kvmem[d]+=row[d]*kj; }
+            for(int d=0;d<vdim;d++) delta[d]=(vv[d]-kvmem[d])*beta;
+            for(int j=0;j<kdim;j++){ float kj=kv_[j], *row=Sh+(int64_t)j*vdim; for(int d=0;d<vdim;d++) row[d]+=kj*delta[d]; }
+            float *o=core+(int64_t)s*vd+hv*vdim;
+            for(int d=0;d<vdim;d++) o[d]=0;
+            for(int j=0;j<kdim;j++){ float qj=qv[j], *row=Sh+(int64_t)j*vdim; for(int d=0;d<vdim;d++) o[d]+=row[d]*qj; }
+            const float *zz=z_all+hv*vdim; float var=0;   /* gated RMSNorm: gate first, then normalize */
+            for(int d=0;d<vdim;d++){ float og=o[d]*(zz[d]/(1.f+expf(-zz[d]))); o[d]=og; var+=og*og; }
+            float inv=1.f/sqrtf(var/vdim+c->eps);
+            for(int d=0;d<vdim;d++) o[d]=o[d]*inv*l->dn_norm[d];
+        }
+    }
+    matmul_qt(out,core,&l->dn_out,S);
+    m->t_attn+=now_s()-ta0;
+    QDBG("dn L%d: S=%d kh=%d vh=%d grp=%d K=%d core0=%.4f out0=%.4f\n",layer,S,kh,vh,grp,K,core[0],out[0]);
+    free(PZ);free(PB);free(mixed);free(core);free(kvmem);free(delta);
+}
+
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D,x+(int64_t)s*D,l->in_ln,D,c->eps);
-    attention(m,l,li,nrm,S,pos_base,tmp);
+    if(l->attn_type==1)   gated_deltanet(m,l,li,nrm,S,pos_base,tmp);
+    else if(c->is_qwen36) attention_qwen(m,l,li,nrm,S,pos_base,tmp);
+    else                  attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D,x+(int64_t)s*D,l->post_ln,D,c->eps);
     if(l->sparse) moe(m,l,li,nrm,x,S,tmp);
@@ -2895,6 +3273,13 @@ static void profile_print(Model *m, double elapsed){
             g_predict,100.0*m->pred_hit/m->pred_seen,
             (unsigned long long)m->pred_hit,(unsigned long long)m->pred_seen,
             (unsigned long long)m->pred_issued);
+    if(g_predict_load&&(m->spec_enq||m->spec_drop))
+        printf("PREDICT_LOAD: %llu speculative loads | %llu dropped (queue full) | %llu waited on at compute\n",
+            (unsigned long long)m->spec_enq,(unsigned long long)m->spec_drop,
+            (unsigned long long)m->spec_wait);
+    if(g_gate_tau>0&&g_gate_tok)
+        printf("GATE_TAU: %.2f | avg routed experts %.2f/layer (topk=%d) over %llu (token,layer) routings\n",
+            g_gate_tau,(double)g_gate_kept/g_gate_tok,m->c.topk,(unsigned long long)g_gate_tok);
 }
 
 static void perf_report(Model *m){
@@ -2910,7 +3295,9 @@ static void stats_dump_q(Model *m, const char *path, int quiet){
     char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
     FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
     Cfg *c=&m->c; int64_t tot=0, nz=0;
-    for(int i=0;i<c->n_layers;i++){ if(!m->eusage[i]) continue;
+    /* i<=n_layers: the MTP layer (i==n_layers) routes real experts too — its rows
+     * feed autopin (pin_load already accepts l==n_layers) and surgery's pruning. */
+    for(int i=0;i<=c->n_layers;i++){ if(!m->eusage[i]) continue;
         for(int e=0;e<c->n_experts;e++) if(m->eusage[i][e]){
             fprintf(f,"%d %d %u\n",i,e,m->eusage[i][e]); tot+=m->eusage[i][e]; nz++; } }
     fclose(f); rename(tmp,path);
@@ -2921,10 +3308,35 @@ static int64_t usage_load(Model *m, const char *path){
     FILE *f=fopen(path,"r"); if(!f) return 0;
     Cfg *c=&m->c; int l,e; uint32_t cnt; int64_t tot=0;
     while(fscanf(f,"%d %d %u",&l,&e,&cnt)==3)
-        if(l>=0&&l<c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
+        if(l>=0&&l<=c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
     fclose(f); return tot;
 }
-static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
+/* SALIENCY: persistent per-(layer,expert) sums of applied gate weights, same
+ * text shape as .coli_usage but with a float value. Accumulates across sessions
+ * like usage; consumed by tools/surgery_hy3.py as the pruning criterion. */
+static char g_sal_path[2100]="";
+static void sal_dump(Model *m){
+    if(!g_sal_path[0]||!g_saliency||!m->esal) return;
+    char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",g_sal_path);
+    FILE *f=fopen(tmp,"w"); if(!f) return;
+    Cfg *c=&m->c;
+    for(int i=0;i<=c->n_layers;i++){ if(!m->esal[i]) continue;
+        for(int e=0;e<c->n_experts;e++) if(m->esal[i][e]>0)
+            fprintf(f,"%d %d %.6g\n",i,e,(double)m->esal[i][e]); }
+    fclose(f); rename(tmp,g_sal_path);
+}
+static int64_t sal_load(Model *m, const char *path){
+    FILE *f=fopen(path,"r"); if(!f) return 0;
+    Cfg *c=&m->c; int l,e; double v; int64_t n=0;
+    while(fscanf(f,"%d %d %lf",&l,&e,&v)==3)
+        if(l>=0&&l<=c->n_layers&&e>=0&&e<c->n_experts&&m->esal&&m->esal[l]&&v>0){ m->esal[l][e]+=(float)v; n++; }
+    fclose(f); return n;
+}
+static void usage_save(Model *m){
+    if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1);
+    sal_dump(m);
+    if(g_trace) fflush(g_trace);
+}
 
 /* log-likelihood scoring (SCORE=requests.txt): one forward per line, teacher-forcing */
 static double logprob_target(const float *lo, int V, int target, int *am){
@@ -3027,9 +3439,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int nsp=0; for(int i=0;i<m->c.n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\n%d tokens in %.2fs (%.2f tok/s) | expert hit %.1f%% | RSS %.2f GB\n",
         produced,dt,produced/dt,tot?100.0*m->hits/tot:0.0,rss_gb());
-    printf("experts loaded/token: %.1f (per-layer %.2f across %d; topk=%d) | TOPK=%d TOPP=%.2f\n",
+    printf("experts loaded/token: %.1f (per-layer %.2f across %d; topk=%d) | TOPK=%d TOPP=%.2f GATE_TAU=%.2f\n",
         produced?(double)m->ereq/produced:0.0,(produced&&nsp)?(double)m->ereq/produced/nsp:0.0,
-        nsp,m->c.topk,g_topk,g_topp);
+        nsp,m->c.topk,g_topk,g_topp,g_gate_tau);
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0,(unsigned long long)m->n_fw,(unsigned long long)m->n_emit,
         m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0,(unsigned long long)m->mtp_acc,(unsigned long long)m->mtp_prop);
@@ -3200,6 +3612,17 @@ int main(int argc, char **argv){
     g_nuc=getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;
     g_topk=getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp=getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_gate_tau=getenv("GATE_TAU")?(float)atof(getenv("GATE_TAU")):0;
+    if(g_gate_tau<0) g_gate_tau=0;
+    if(g_gate_tau>1) g_gate_tau=1;
+    if(g_gate_tau>0)
+        fprintf(stderr,"[GATE] adaptive experts: drop routed experts with gate < %.2f x strongest (output NOT bit-identical; GATE_TAU=0 restores exact routing)\n",g_gate_tau);
+    g_saliency=getenv("SALIENCY")?atoi(getenv("SALIENCY")):1;
+    if(getenv("ROUTE_TRACE")){
+        g_trace=fopen(getenv("ROUTE_TRACE"),"a");
+        if(!g_trace) perror(getenv("ROUTE_TRACE"));
+        else fprintf(stderr,"[TRACE] routed-expert trace (co-activation calibration) -> %s\n",getenv("ROUTE_TRACE"));
+    }
     g_repin=getenv("REPIN")?atoi(getenv("REPIN")):0;
     g_draft=getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
     if(g_draft>63) g_draft=63;
@@ -3211,10 +3634,21 @@ int main(int argc, char **argv){
     if(g_predict<0) g_predict=0;
     if(g_predict>8) g_predict=8;
     g_predict_k=getenv("PREDICT_K")?atoi(getenv("PREDICT_K")):0;
+    /* PREDICT_LOAD: -1 = auto (on under DIRECT=1, where fadvise hints cannot work;
+     * off otherwise). Explicit 0/1 wins. See spec pool above for the rationale. */
+    g_predict_load=getenv("PREDICT_LOAD")?atoi(getenv("PREDICT_LOAD")):-1;
+    g_spec_nw=getenv("SPEC_WORKERS")?atoi(getenv("SPEC_WORKERS")):8;
     if(g_predict&&g_direct){
-        fprintf(stderr,"[PREDICT] disabled: DIRECT=1 bypasses the page cache the prefetch hints warm\n");
-        g_predict=0;
+        if(g_predict_load==0){
+            fprintf(stderr,"[PREDICT] disabled: DIRECT=1 bypasses the page cache the prefetch hints warm (PREDICT_LOAD=1 to keep it)\n");
+            g_predict=0;
+        } else {
+            g_predict_load=1;
+            fprintf(stderr,"[PREDICT] DIRECT=1: prefetch hints become speculative LRU loads (PREDICT_LOAD=1, %d workers)\n",g_spec_nw);
+        }
     }
+    if(g_predict_load<0) g_predict_load=0;
+    if(!g_predict) g_predict_load=0;
     if(g_predict){
         if(g_predict_k>0)
             fprintf(stderr,"[PREDICT] cross-layer expert prefetch: %d layer(s) ahead, %d experts/layer (PREDICT=0 to disable)\n",
@@ -3308,6 +3742,9 @@ int main(int argc, char **argv){
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       int64_t hist=usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
+      snprintf(g_sal_path,sizeof(g_sal_path),"%s/.coli_saliency",snap);
+      { int64_t sh=sal_load(&m,g_sal_path);
+        if(sh>0) fprintf(stderr,"[SALIENCY] gate-mass history: %lld entries (%s)\n",(long long)sh,g_sal_path); }
       if(getenv("PRELOAD")){
           preload_all(&m,ram_env,est_ctx);   /* whole model resident: VRAM + RAM, disk only for the residual */
           pinned_any=1;
@@ -3328,6 +3765,13 @@ int main(int argc, char **argv){
 #endif
       (void)pinned_any;   /* only consumed by the CUDA prefill above */
       cap_for_ram(&m,ram_env,ebits,est_ctx); }
+    /* Speculative loads claim LRU slots ahead of use: with a cache this small
+     * they would evict the layer's own working set. Fall back to hints. */
+    if(g_predict_load&&m.ecap<2*m.c.topk){
+        fprintf(stderr,"[PREDICT] cache too small for speculative loads (cap=%d < 2*topk=%d): %s\n",
+            m.ecap,2*m.c.topk,g_direct?"prediction disabled":"using fadvise hints");
+        g_predict_load=0; if(g_direct) g_predict=0;
+    }
 
     const char *stats=getenv("STATS");
     if(getenv("SCORE")){ run_score(&m,getenv("SCORE")); if(stats) stats_dump(&m,stats); usage_save(&m); return 0; }

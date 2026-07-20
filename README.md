@@ -109,6 +109,11 @@ Works on 16 GB RAM; experts matmul on CPU. Slower decode, same memory story.
 | **`PIPE=2`** | io_uring expert reads (needs `make hy3 IOURING=1`; falls back to `PIPE=1`). |
 | **`PREDICT=N`** | Cross-layer expert prediction + prefetch, **default 2** layers ahead: run future layers' routers on the current residual and issue async readahead for the predicted experts, so decode's per-layer disk waits overlap compute. Hint-only — output is bit-identical. `PREDICT=0` disables. Auto-off under `DIRECT=1` (O_DIRECT bypasses the page cache the hints warm); no-op on Windows. |
 | **`PREDICT_K=N`** | Experts hinted per predicted layer (default: `topk`). |
+| **`PREDICT_LOAD=1`** | Predictions become **speculative expert loads into the LRU** (small worker pool) instead of fadvise hints. Auto-on under `DIRECT=1` (where fadvise cannot work); also useful with `DROP=1` or on Windows, and whenever the engine LRU — not the page cache — is the main expert cache (e.g. GCP Z3, see [docs/GCP_Z3.md](docs/GCP_Z3.md)). Hint-only speculation: output stays bit-identical. `PREDICT_LOAD=0` restores the old "disable under DIRECT" behavior. |
+| **`SPEC_WORKERS=N`** | Threads serving speculative loads (default 8, max 16). |
+| **`GATE_TAU=x`** | Adaptive expert count: drop routed experts whose gate weight is below `x`× the strongest, renormalize the rest (try 0.2–0.4). Fewer disk reads per token at a **measured quality cost — not bit-identical**; 0 (default) = exact routing. See [docs/SURGERY.md](docs/SURGERY.md). |
+| **`SALIENCY=0`** | Disable the `.coli_saliency` gate-mass histogram (on by default; it is the pruning criterion for checkpoint surgery and never affects outputs). |
+| **`ROUTE_TRACE=file`** | Append per-(token,layer) routed expert ids — co-activation calibration for surgery's `--reorder coact`. Off unless set. |
 | **`KV_I8=1`** | int8 KV cache (~4× smaller KV RAM; float in-flight row for current position). |
 | **`IDOT=0`** | Disable the int8-activation integer matmul kernels (on by default: avx512-vnni / avx-vnni / avx2 / neon, ~2-3× on quantized matmuls, ~0.3% RMS noise per matmul). Set 0 for the exact f32 dequant path. |
 | **`NUMA=0`** | Disable automatic page interleave (enabled by default when >1 memory node is visible; evens out per-thread bandwidth on multi-socket/multi-die boxes). |
@@ -228,6 +233,10 @@ Hy3 cold decode reads **~5–6 GB of experts per token** from disk (79 MoE layer
 
 Tuning: `--ram` sizes the cache budget; `--vram` + `--gpu` move hot experts to the card; autopin/PIN from `.coli_usage`; `DIRECT=1` on NVMe; `PIPE=1` or `PIPE=2` (io_uring); optional `CUDA_ATTN=1`, `KV_I8=1`, `PERF=1`.
 
+**Cloud "little RAM + fast disk" deployment:** [docs/GCP_Z3.md](docs/GCP_Z3.md) — full walkthrough for GCP Z3 storage-optimized VMs (Titanium SSD @ 3 GB/s/disk, ~0.7–1 tok/s expected on the free-trial 8-vCPU shape), incl. `scripts/z3_setup.sh` + `scripts/z3_bench.sh`.
+
+**Checkpoint surgery (make the model fit the engine):** [docs/SURGERY.md](docs/SURGERY.md) — prune the least-salient experts, re-encode the cold tail at int2, and reorder experts on disk by co-activation (`tools/surgery_hy3.py` + `scripts/surgery_*.sh`). 142 GB → 75–110 GB containers that cache far better, plus a runtime `GATE_TAU` dial; every step A/B-measurable against the stock container.
+
 **Throughput numbers:** mid-stream `[t=N] … tok/s` and the chat footer’s **decode** rate measure generation only (from first emitted token). The footer’s **total** rate includes prefill for that turn (full prompt on turn 1, incremental new tokens on follow-ups). Example: `└─ 38 tok · 0.10 tok/s total · 0.24 tok/s decode · …`.
 
 ### Cross-layer expert prediction (PREDICT, default on)
@@ -305,6 +314,7 @@ Model id: `hy3-colibri`.
 | **Colibri int4 format** | `out-*.safetensors` + per-row `.qs` scales — incompatible with GGUF/AWQ |
 | **`convert_hy3.py`** | Hy3-FP8 per-tensor `weight_scale` dequant, `shared_mlp` → `shared_experts` naming |
 | **`hy3.c`** | GQA, sigmoid+bias router, route norm, batch-union MoE, LRU/pin cache |
+| **`surgery_hy3.py`** | container surgery: saliency-based expert pruning, int2 cold tail, co-activation disk layout ([docs/SURGERY.md](docs/SURGERY.md)) |
 | **Chat template** | Hunyuan `｜` delimiters, `coli chat` + `coli serve` |
 
 Base model: [tencent/Hy3](https://huggingface.co/tencent/Hy3) / [Hy3-FP8](https://huggingface.co/tencent/Hy3-FP8) (Apache 2.0).  
@@ -332,6 +342,7 @@ Same idea as [GLM-5.2-colibri-int4](https://huggingface.co/jlnsrk/GLM-5.2-colibr
 - 4-row-blocked idot matmuls (weight row loaded and int4-unpacked once per 4 batch rows, 4 independent accumulator chains: ~1.2-1.4x on MTP verify forwards, up to ~1.8x on int4 prefill, measured on AVX2) and a vectorized serial activation quantizer (~20x; it was an Amdahl term at high thread counts).
 - Performance knobs: AVX2 attention, `KV_I8=1` int8 KV, `PERF=1` breakdown, `PIPE=2` io_uring loads, `CUDA_ATTN=1` GPU attention, NUMA page interleave (`NUMA=0` to disable)
 - Cross-layer expert prediction + prefetch (`PREDICT=2` default): future layers' routers run on the current residual and readahead-hint their predicted experts, overlapping decode's per-layer disk waits with compute; hit rate is measured and printed (`PREDICT:` line). Hint-only — token-exact with the feature on or off.
+- Checkpoint surgery ([docs/SURGERY.md](docs/SURGERY.md)): expert pruning by gate-mass saliency, hot-int4/cold-int2 mixed-precision containers (loader infers packing per tensor — no flag), co-activation disk reordering (bit-identical), `GATE_TAU` adaptive expert count, `.coli_saliency` + `ROUTE_TRACE` calibration observers.
 - `coli chat` / `coli serve` / `coli convert` / `coli plan` / `coli doctor`
 
 **Not yet**
