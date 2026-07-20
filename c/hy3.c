@@ -2549,7 +2549,7 @@ static int mtp_one_forward(Model *m, int tok, int pos, float *logit){
     float *x=falloc(D), *cat=falloc(2*D), *hx=falloc(D), *nrm=falloc(D), *tmp=falloc(D);
     float *row=falloc(D), *h=falloc(D);
     memcpy(h,m->hlast,D*sizeof(float));
-    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    int prenorm=getenv("MTP_PRENORM")!=NULL || c->is_qwen36;  /* qwen NEXTN: raw hidden -> hnorm only */
     embed_row(m,tok,x);
     rmsnorm(x,x,m->enorm,D,c->eps);
     if(!prenorm) rmsnorm(h,h,m->final_norm,D,c->eps);
@@ -2621,7 +2621,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
     memcpy(h,m->hlast,D*sizeof(float));
     int tok=next_tok, n=0;
-    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    int prenorm=getenv("MTP_PRENORM")!=NULL || c->is_qwen36;  /* qwen NEXTN: raw hidden -> hnorm only */
     for(int g=0;g<G;g++){
         int pos=p+g; if(pos+2>=m->max_t) break;
         embed_row(m,tok,x);
@@ -2653,7 +2653,7 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
     if(m->kv_start[li]<0||m->kv_start[li]>pos_base) m->kv_start[li]=pos_base;
     float *hx=falloc((int64_t)S*D), *cat=falloc(2*D), *e=falloc(D), *hn=falloc(D), *hf=falloc(D);
-    int prenorm=getenv("MTP_PRENORM")!=NULL;
+    int prenorm=getenv("MTP_PRENORM")!=NULL || c->is_qwen36;  /* qwen NEXTN: raw hidden -> hnorm only */
     for(int i=0;i<S;i++){
         embed_row(m,next_ids[i],e);
         rmsnorm(e,e,m->enorm,D,c->eps);
