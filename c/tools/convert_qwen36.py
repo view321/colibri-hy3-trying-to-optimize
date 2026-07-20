@@ -73,32 +73,39 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
     import torch
     with safe_open(path, framework="pt") as f:
         for name in f.keys():
-            li = layer_idx(name)
-            if li is not None and li >= 0 and li >= n_layers and not keep_mtp:
+            # skip the vision tower — the engine runs text-only
+            if name.startswith("model.visual") or ".visual." in name:
                 continue
+            # the real multimodal model nests the LM under model.language_model.* ;
+            # strip to model.* so the container matches the loader (no-op for the
+            # text-only tiny fixture; lm_head.weight is already top-level).
+            oname = name.replace("model.language_model.", "model.", 1)
+            li = layer_idx(oname)
+            if li is not None and li >= 0 and li >= n_layers and not keep_mtp:
+                continue   # drops the MTP layer (index n_layers) for now
             # --- fused experts -> per-expert (the big reconciliation) ---
-            if name.endswith("mlp.experts.gate_up_proj"):
+            if oname.endswith("mlp.experts.gate_up_proj"):
                 w = f.get_tensor(name).to(torch.float32).numpy()   # [E, 2I, D]
                 E, twoI, _ = w.shape
                 I = twoI // 2
-                pre = name[:-len("gate_up_proj")]                  # ...mlp.experts.
+                pre = oname[:-len("gate_up_proj")]                 # ...mlp.experts.
                 for j in range(E):
                     emit(out_dict, f"{pre}{j}.gate_proj.weight", w[j, :I, :], xbits)
                     emit(out_dict, f"{pre}{j}.up_proj.weight",   w[j, I:, :], xbits)
                 continue
-            if name.endswith("mlp.experts.down_proj"):
+            if oname.endswith("mlp.experts.down_proj"):
                 w = f.get_tensor(name).to(torch.float32).numpy()   # [E, D, I]
                 E = w.shape[0]
-                pre = name[:-len("down_proj")]
+                pre = oname[:-len("down_proj")]
                 for j in range(E):
                     emit(out_dict, f"{pre}{j}.down_proj.weight", w[j], xbits)
                 continue
             # --- everything else ---
-            kind = classify(name)
+            kind = classify(oname)
             if kind == "consumed":
                 continue
             w = base.dequant(f, name)
-            oname = rename_out(name)
+            oname = rename_out(oname)
             bits = io_bits if kind == "io" else (ebits if kind == "q" else 99)  # f32 => 99
             emit(out_dict, oname, w, bits)
 
@@ -121,7 +128,8 @@ def main():
         convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
         save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
     for fn in ("config.json", "tokenizer.json", "tokenizer_config.json",
-               "generation_config.json", "chat_template.jinja"):
+               "generation_config.json", "chat_template.jinja",
+               "vocab.json", "merges.txt", "special_tokens_map.json"):
         src = os.path.join(a.indir, fn)
         if os.path.exists(src):
             shutil.copy(src, a.outdir)

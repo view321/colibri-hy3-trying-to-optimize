@@ -73,7 +73,7 @@ def engine_for(model):
     forced=os.environ.get("COLI_ENGINE","").lower()
     if forced in ("hy3","glm"): return HY3 if forced=="hy3" else GLM
     cfg=model_config(model)
-    return HY3 if cfg.get("model_type")=="hy_v3" else GLM
+    return HY3 if cfg.get("model_type") in ("hy_v3","qwen3_5_moe","qwen3_5_moe_text") else GLM
 
 def engine_name(model):
     return "hy3" if engine_for(model)==HY3 else "glm"
